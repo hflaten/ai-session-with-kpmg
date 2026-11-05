@@ -39,7 +39,8 @@ Placeholders used below — replace them in the Lovable project, never commit re
 | POST | `/agent/run` | JSON `RunRequest` | `{run_id, answer, stopped_reason, trace}` when finished (no live steps) |
 | GET | `/agent/stream` | `?task=&mode=&api_key=` | SSE stream for `EventSource` (no `output_schema`) |
 | GET | `/runs/{run_id}` | – | the stored run: `{id, task, status, answer, trace, agent_name, parent_run_id, …}` |
-| GET | `/runs/{run_id}/sources` | – | the answer's sources **resolved**: page text / table rows (section 5) |
+| GET | `/runs/{run_id}/sources` | – | the answer's sources **resolved**: page text / table rows, `marker`, latest `review`, plus a review `summary` (sections 5 and 8) |
+| POST | `/runs/{run_id}/sources/{index}/review` | `{decision: "accepted" \| "rejected", reviewer?, comment?}` | `{run_id, index, marker, review}` (section 8) |
 | GET | `/runs/{run_id}/tree` | – | delegation tree `{id, agent_name, task, status, duration_ms, children: [...]}` |
 | GET | `/approvals` | – | `{pending: [{run_id, tool, input, waiting_seconds}]}` |
 | POST | `/runs/{run_id}/approve` | `{reason?: string}` | `{run_id, decision: "approved"}` |
@@ -141,7 +142,7 @@ With an `output_schema`, `answer` looks like this (your fields + `sources`):
 
 ```json
 {
-  "answer": "Only Oslo met the 45% target (46.3%). Bergen (41.8%) and Trondheim (38.9%) missed it...",
+  "answer": "The target was at least 45% for every office [1]. Only Oslo met it, at 46.3% [2]. Bergen missed it at 41.8% after hiring four junior auditors [2][3].",
   "sources": [
     {"claim": "The target is at least 45% gross margin for every office",
      "document_name": "nordvik_q1_2026_report.pdf", "page_number": 1,
@@ -161,21 +162,36 @@ Two kinds of source — tell them apart by which key exists:
 The backend has already checked that every cited chunk was really found by a search in this
 run (same document and page), and every SQL really ran. One claim can have several entries.
 
+### Inline markers `[n]`
+
+The answer text cites inline: **`[n]` right after a claim, where `n` is the 1-based position in
+`sources`** — `[1]` is `sources[0]`, `[2]` is `sources[1]`. A claim with two sources gets `[1][2]`.
+The backend guarantees: every marker points to an existing source, and every source is marked at
+least once (otherwise the model is made to fix its answer). Markers can appear in any text field
+of your schema, not only `answer`.
+
+To render: split the text on `/\[(\d+)\]/`, turn each number into a clickable superscript, and
+make the sentence (or clause) just before it clickable too.
+
 ## 5. Clickable sources: `GET /runs/{run_id}/sources`
 
-Call this after `done`. It returns the same sources, in the same order (`index`), with the evidence:
+Call this after `done`. It returns the same sources, in the same order, with the evidence,
+the inline `marker` (`index + 1`) and the latest human `review` (section 8):
 
 ```json
 {
   "run_id": "b9f8fc9e-...",
+  "summary": {"total": 4, "accepted": 1, "rejected": 1, "unreviewed": 2},
   "sources": [
-    {"index": 0, "kind": "document", "claim": "...", "document_name": "nordvik_q1_2026_report.pdf",
+    {"index": 0, "marker": 1, "kind": "document", "claim": "...", "document_name": "nordvik_q1_2026_report.pdf",
      "page_number": 1, "chunk_id": "nordvik_q1_2026_report.pdf:p1:c0",
-     "text": "Nordvik Advisory - Q1 2026 Management Report ...", "error": null},
-    {"index": 1, "kind": "database", "claim": "...", "table": "sample_sales", "sql": "select ...",
+     "text": "Nordvik Advisory - Q1 2026 Management Report ...", "error": null,
+     "review": {"decision": "accepted", "reviewer": "Ana", "comment": "matches page 1",
+                "created_at": "2026-11-05T15:02:11Z", "id": "...", "source_index": 0}},
+    {"index": 1, "marker": 2, "kind": "database", "claim": "...", "table": "sample_sales", "sql": "select ...",
      "columns": ["region", "revenue", "cost", "margin_pct"],
      "rows": [{"region": "Bergen", "revenue": 710000.0, "cost": 413000.0, "margin_pct": 41.83}],
-     "row_count": 3, "truncated": false, "error": null}
+     "row_count": 3, "truncated": false, "error": null, "review": null}
   ]
 }
 ```
@@ -225,6 +241,29 @@ const res = await fetch(`${BACKEND_URL}/upload/table`, {  // or /upload/pdf for 
   One table per CSV or per Excel sheet. Re-uploading the same file name replaces it.
 - PDF upload → `{document_name, pages, chunks}`. Takes a few seconds (embeddings).
 - Uploaded data is available to the agent in the very next question.
+
+## 8. Per-claim review: accept / reject a source
+
+A reviewer can accept or reject each cited source of a finished answer.
+
+```ts
+await fetch(`${BACKEND_URL}/runs/${runId}/sources/${index}/review`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
+  body: JSON.stringify({ decision: "accepted", reviewer: "Ana", comment: "matches page 1" }),
+});
+// -> { run_id, index, marker, review: { id, created_at, source_index, decision, reviewer, comment } }
+```
+
+> **Numbering:** `{index}` in the URL is **0-based** — the `index` field from `/sources`.
+> The marker in the text is **1-based**: marker `[3]` → the source with `marker: 3` → its `index` is 2.
+
+- `decision`: `"accepted"` or `"rejected"`; `reviewer` and `comment` are optional.
+- Reviewing again adds a new review; the newest one is the current decision (`/sources` returns it
+  as `review`). History is kept in the database.
+- `GET /runs/{run_id}/sources` → `summary: {total, accepted, rejected, unreviewed}` for a progress
+  bar: "{accepted} of {total} claims verified".
+- 404 = unknown run, or index out of range. 422 = `decision` missing or not one of the two values.
 
 ---
 
@@ -313,6 +352,9 @@ STREAM EVENTS
 - "error": data { error }. Show it as an error bubble.
 
 CLICKABLE SOURCES
+- data.answer.answer contains inline markers [1], [2]... right after each claim; [n] is the
+  1-based position in data.answer.sources. Render each marker as a clickable superscript that
+  opens that source's side sheet (below).
 - data.answer.sources is a list. Each item is EITHER a document source
   { claim, document_name, page_number, chunk_id } OR a database source { claim, table, sql }.
 - After "done", call GET {BACKEND_URL}/runs/{run_id}/sources. It returns
@@ -347,4 +389,50 @@ STYLE
   "Which regions met the Q1 2026 margin target, and why did the others miss it?"
   "Total revenue per product per month"
   "Summarise the uploaded report and save it as a report"
+````
+
+---
+
+## Ready-to-paste prompt: inline citations + claim review (UI change)
+
+For an app already built from the prompt above. Paste as a follow-up message in Lovable:
+
+````text
+Add inline citations and per-claim review to the assistant answers. Use only the API below.
+
+1. INLINE MARKERS
+- The answer text (data.answer.answer from the "done" event) contains markers like [1], [2]
+  right after each claim. [n] is 1-based: [1] = data.answer.sources[0].
+- Render the answer as Markdown, but split it on the regex /\[(\d+)\]/ and make each marker a
+  small superscript badge. Make the sentence or clause just before a marker clickable too
+  (subtle dotted underline). A claim can have several markers, e.g. [1][2].
+- Clicking a marker or its sentence opens the existing source side sheet for that source.
+
+2. REVIEW STATE
+- After "done", and after every review, call GET {BACKEND_URL}/runs/{run_id}/sources (with the
+  X-API-Key header). It returns { summary: {total, accepted, rejected, unreviewed}, sources: [...] }.
+  Each source has: index (0-based), marker (1-based, = index + 1), kind, claim, the evidence
+  (text for documents; columns + rows + sql for database), error, and review (null, or
+  {decision: "accepted" | "rejected", reviewer, comment, created_at}).
+- Highlight each marked sentence and its badge by its source's review:
+    accepted -> green background, rejected -> red background with strikethrough on the badge,
+    no review -> no highlight. If a sentence has several markers, red wins over green; it is
+    green only when all its sources are accepted.
+
+3. ACCEPT / REJECT IN THE SOURCE SHEET
+- At the bottom of the source side sheet add: an optional "Comment" textarea, a "Reviewer"
+  text field (remember its value in localStorage), and two buttons "Accept" (green) and
+  "Reject" (red).
+- Clicking sends POST {BACKEND_URL}/runs/{run_id}/sources/{index}/review with headers
+  Content-Type: application/json and X-API-Key, body
+  { "decision": "accepted" or "rejected", "reviewer": <text or omit>, "comment": <text or omit> }.
+  IMPORTANT: {index} is the 0-based "index" field of that source, NOT the marker number.
+- On success, show a toast "Claim [marker] accepted/rejected", then reload /sources to refresh
+  the highlights and the progress bar. If the source already has a review, show it in the sheet
+  ("Rejected by Ana: wrong quarter") and let the user change it (a new review replaces it).
+
+4. PROGRESS BAR
+- Above each assistant answer that has sources, show a thin progress bar and the text
+  "{summary.accepted} of {summary.total} claims verified", plus "· {summary.rejected} rejected"
+  in red if rejected > 0. Green fill = accepted share, red segment = rejected share.
 ````

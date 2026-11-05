@@ -59,6 +59,23 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 - Simple, readable code — the user has to explain it.
 - Test each step; commit and push after each working step.
 
+## Endpoints (for the Lovable frontend)
+
+| Method | Path | Body / params | Returns |
+|---|---|---|---|
+| GET | `/health` | – | `{status, llm_provider, llm_model, database}` |
+| POST | `/agent/run` | `{task, system_prompt?, output_schema?}` | `{run_id, answer, stopped_reason, trace}` |
+| POST | `/agent/stream` | same JSON body | SSE stream (below) — read with `fetch` + `response.body.getReader()` |
+| GET | `/agent/stream` | `?task=...&system_prompt=...` | SSE stream — works with `new EventSource(url)` (no output_schema) |
+| GET | `/runs/{run_id}` | – | the logged row from `agent_runs` |
+
+SSE events, in order: `run_started` `{run_id}` → one `step` per trace entry
+(`type`: `llm` | `tool` | `final_answer`) → `done` `{run_id, answer, stopped_reason, trace}`,
+or `error` `{error}` if the run crashed.
+
+`answer` is a string, or an object matching `output_schema` when one is given
+(it must have `"type": "object"` at the top level).
+
 ## Run locally
 
 ```bash
@@ -92,6 +109,6 @@ the first request after a sleep takes ~30–60 s, and any run waiting for approv
 
 - [x] 0a Repo (private, pushed)  - [x] 0b Supabase project, link, init migration
 - [x] 1 FastAPI skeleton         - [x] 2 LLM adapters (OpenAI live check pending credits)  - [x] 3 Agent loop
-- [x] 4 query_database           - [x] 5 Structured output - [ ] 6 SSE + run logging
+- [x] 4 query_database           - [x] 5 Structured output - [x] 6 SSE + run logging
 - [ ] 7 Uploads + RAG (approval checkpoint first) - [ ] 8 Human-in-the-loop
 - [ ] 9 Orchestrator             - [ ] 10 Deploy

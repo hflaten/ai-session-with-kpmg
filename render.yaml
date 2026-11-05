@@ -1,0 +1,45 @@
+# Render Blueprint: New > Blueprint > pick this repo.
+# Secret values are NOT stored here (sync: false) - paste them in the Render dashboard.
+services:
+  - type: web
+    name: ai-session-with-kpmg
+    runtime: python
+    region: frankfurt          # same region as Supabase (eu-central-1)
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # One worker: human-in-the-loop approvals are held in memory (step 8)
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.1
+      - key: LLM_PROVIDER
+        value: anthropic
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        sync: false
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
+      - key: EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: SUPABASE_PROJECT_REF
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_DB_PASSWORD
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_READONLY_DB_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: http://localhost:3000,https://*.lovable.app,https://*.lovableproject.com

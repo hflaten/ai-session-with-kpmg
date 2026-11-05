@@ -1,0 +1,7 @@
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+python-dotenv==1.0.*
+psycopg[binary]==3.2.*
+# tests
+pytest==8.*
+httpx==0.28.*

@@ -68,6 +68,10 @@ def call(system: str, messages: list[dict], tools: list[Tool], force_tool: str |
         kwargs["tools"] = to_openai_tools(tools)
     if force_tool:
         kwargs["tool_choice"] = {"type": "function", "function": {"name": force_tool}}
+    if settings.openai_reasoning_effort:
+        # Some models (e.g. gpt-6.1-terra) only allow tools on Chat Completions with "none".
+        # Only sent when set, so gateways that don't know the parameter never see it.
+        kwargs["reasoning_effort"] = settings.openai_reasoning_effort
     resp = _get_client().chat.completions.create(
         model=settings.openai_model,
         messages=to_openai_messages(system, messages),

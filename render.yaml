@@ -25,6 +25,8 @@ services:
         sync: false
       - key: OPENAI_BASE_URL
         value: https://api.openai.com/v1
+      - key: OPENAI_REASONING_EFFORT
+        value: none
       - key: EMBEDDING_MODEL
         value: text-embedding-3-small
       - key: SUPABASE_PROJECT_REF

@@ -29,6 +29,7 @@ class Settings:
     openai_api_key: str
     openai_model: str
     openai_base_url: str
+    openai_reasoning_effort: str    # optional; only sent to the API when set
     embedding_model: str
     supabase_url: str
     supabase_service_role_key: str  # backend only - never returned by any endpoint
@@ -50,6 +51,7 @@ def load_settings() -> Settings:
         openai_api_key=_get("OPENAI_API_KEY"),
         openai_model=_get("OPENAI_MODEL"),
         openai_base_url=_get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        openai_reasoning_effort=_get("OPENAI_REASONING_EFFORT"),
         embedding_model=_get("EMBEDDING_MODEL", "text-embedding-3-small"),
         supabase_url=_get("SUPABASE_URL"),
         supabase_service_role_key=_get("SUPABASE_SERVICE_ROLE_KEY"),

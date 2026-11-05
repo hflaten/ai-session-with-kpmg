@@ -127,3 +127,17 @@ def test_unknown_provider_is_a_clear_error(monkeypatch):
     monkeypatch.setattr(client, "settings", SimpleNamespace(llm_provider="gemini"))
     with pytest.raises(ValueError, match="Unknown LLM_PROVIDER"):
         client.call_llm("s", [])
+
+
+@pytest.mark.parametrize("effort, expected", [("none", "none"), ("", None)])
+def test_reasoning_effort_only_sent_when_set(monkeypatch, effort, expected):
+    from dataclasses import replace
+    resp = ChatCompletion.model_validate({
+        "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "hi"}}]})
+    fake = FakeCreate(resp)
+    monkeypatch.setattr(openai_adapter, "_get_client",
+                        lambda: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake))))
+    monkeypatch.setattr(openai_adapter, "settings", replace(openai_adapter.settings, openai_reasoning_effort=effort))
+    openai_adapter.call("s", [{"role": "user", "content": "x"}], [])
+    assert fake.kwargs.get("reasoning_effort") == expected

@@ -77,7 +77,10 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 **Inline markers** (`marker_errors`): the answer text must cite with `[n]` right after each claim, `n` = 1-based
 position in `sources`. Every marker must map to a source, every source must be marked, and **each marker
 appears exactly once** (one marker = one claim; two claims on the same evidence = two `sources` entries;
-`[1][2]` = one claim, two sources). Markers are read from all text fields except `sources`. Failures go back to the model.
+`[1][2]` = one claim, two sources). Each claim is a single sentence or clause with its marker right after it;
+`unmarked_fact_errors` rejects any sentence containing a digit (number, %, date) without a marker (headings and
+list numbering ignored; spelled-out numbers not detected). Markers are read from all text fields except `sources`.
+Failures go back to the model.
 
 **Citation checks** (`citation_errors` in `app/agent/structured.py`): a `chunk_id` must have been
 returned by `search_documents` in this run with the same document and page; a `sql` must match

@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from app.agent.structured import (SUBMIT_TOOL_NAME, Evidence, citation_errors, make_submit_tool,
-                                  marker_errors, validation_errors, with_sources)
+                                  marker_errors, unmarked_fact_errors, validation_errors, with_sources)
 from app.llm import Tool, ToolCall, call_llm
 
 MAX_TOOL_OUTPUT_CHARS = 20_000   # what the LLM sees from one tool call
@@ -139,7 +139,8 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
             if call.name == SUBMIT_TOOL_NAME and output_schema:
                 errors = validation_errors(output_schema, call.input)
                 if not errors:
-                    errors = citation_errors(call.input["sources"], evidence) + marker_errors(call.input)
+                    errors = (citation_errors(call.input["sources"], evidence) + marker_errors(call.input)
+                              + unmarked_fact_errors(call.input))
                 record({"step": step, "type": "final_answer", "input": call.input, "valid": not errors,
                         "errors": errors, "ms": int((time.monotonic() - started) * 1000)})
                 if not errors:

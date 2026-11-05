@@ -2,7 +2,8 @@
 import pytest
 
 from app.agent import loop
-from app.agent.structured import Evidence, answer_text, check_output_schema, citation_errors, marker_errors, with_sources
+from app.agent.structured import (Evidence, answer_text, check_output_schema, citation_errors, marker_errors,
+                                  unmarked_fact_errors, with_sources)
 from app.llm import LLMResponse, Tool, ToolCall
 
 CHUNK = {"chunk_id": "report.pdf:p2:c1", "document_name": "report.pdf", "page_number": 2, "text": "Target 45%"}
@@ -176,3 +177,55 @@ def test_reused_marker_is_sent_back_then_fixed(monkeypatch):
     r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
     assert "used more than once" in seen[2]["content"]
     assert [s["claim"] for s in r.answer["sources"]] == [DOC_SOURCE["claim"], "Recovery plans are due in May"]
+
+
+
+# ---------- facts must carry their own marker ----------
+
+LIVE_ANSWER = ("Management set a target gross margin of at least 45 percent for every regional office for Q1 2026. "
+               "Gross margin is revenue minus direct delivery cost, divided by revenue [1]. Offices below the target "
+               "must present a recovery plan to the board in May 2026 [2].")
+
+
+def test_the_live_multi_sentence_claim_is_rejected():
+    """The real answer where [1] sat after the definition, leaving the 45% sentence unmarked."""
+    errors = unmarked_fact_errors({"answer": LIVE_ANSWER, "sources": [DOC_SOURCE, DOC_SOURCE]})
+    assert len(errors) == 1
+    assert "Management set a target gross margin of at least 45 percent" in errors[0]
+    assert "Make it its own claim" in errors[0]
+
+
+@pytest.mark.parametrize("text", [
+    "The target is 45% [1]. It is defined as revenue minus cost over revenue [2].",
+    "Some context without facts. The target is 45% [1].",                 # context needs no marker
+    "Margin was 41.83 percent [1].",                                      # decimal is not a sentence end
+    "## Q1 2026 results\nOslo met the target [1].",                       # headings are skipped
+    "1. Oslo met it [1]\n2. Bergen missed it [2]",                         # list numbers don't count
+    "Bergen missed it at 41.8% [1], and Trondheim at 38.9% [2].",          # two clauses, one sentence
+])
+def test_marked_or_fact_free_sentences_pass(text):
+    assert unmarked_fact_errors({"answer": text, "sources": []}) == []
+
+
+@pytest.mark.parametrize("text, flagged", [
+    ("Oslo met the target [1]. Revenue was NOK 1.3m in Q1.", "Revenue was NOK 1.3m in Q1."),
+    ("The board meets on 20 May 2026.\nOslo met it [1].", "The board meets on 20 May 2026."),
+    ("- Bergen: 41.8%\n- Oslo [1]", "Bergen: 41.8%"),
+])
+def test_unmarked_numbers_dates_percentages_are_rejected(text, flagged):
+    errors = unmarked_fact_errors({"answer": text, "sources": []})
+    assert len(errors) == 1 and flagged in errors[0]
+
+
+def test_unmarked_fact_is_sent_back_then_fixed(monkeypatch):
+    second = {**DOC_SOURCE, "claim": "Gross margin definition"}
+    seen = scripted(monkeypatch, [
+        LLMResponse("", [ToolCall("a", "search_documents", {"query": "target"})]),
+        LLMResponse("", [ToolCall("b", "submit_answer", {
+            "answer": "The target is 45%. Margin is revenue minus cost over revenue [1].", "sources": [DOC_SOURCE]})]),
+        LLMResponse("", [ToolCall("c", "submit_answer", {
+            "answer": "The target is 45% [1]. Margin is revenue minus cost over revenue [2].", "sources": [DOC_SOURCE, second]})]),
+    ])
+    r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
+    assert "The target is 45%." in seen[2]["content"] and "has no marker" in seen[2]["content"]
+    assert r.answer["answer"].startswith("The target is 45% [1].")

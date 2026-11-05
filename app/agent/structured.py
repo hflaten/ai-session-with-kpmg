@@ -19,7 +19,9 @@ The answer text must also cite inline: "Oslo met the target [1], Bergen missed i
 [n] is the 1-based position in `sources`. Every marker must point to a source, every
 source must be referenced, and each marker appears exactly once: one marker = one claim,
 so each claim can be reviewed on its own. Two claims resting on the same evidence get
-two entries in `sources` (marker_errors).
+two entries in `sources` (marker_errors). Each claim is a single sentence or clause with
+its marker right after it, and any sentence containing a number, percentage or date must
+carry a marker (unmarked_fact_errors).
 
 Invalid answers go back to the model to fix.
 """
@@ -39,7 +41,9 @@ SOURCES_SCHEMA = {
                     "In your answer text, put [n] right after each claim, where n is the 1-based position "
                     "of its entry here (e.g. [1], or [1][2] for a claim with two sources). Each [n] must appear "
                     "EXACTLY ONCE: if two claims rest on the same chunk or query, add a separate entry for each "
-                    "claim (repeat the document/table reference) with its own claim text."),
+                    "claim (repeat the document/table reference) with its own claim text. Each claim is a single "
+                    "sentence or clause with its marker immediately after it; never let one marker cover several "
+                    "sentences. Every sentence with a number, percentage or date needs a marker."),
     "items": {
         "anyOf": [
             {
@@ -98,7 +102,11 @@ def make_submit_tool(schema: dict) -> Tool:
                      "claim, e.g. \"Oslo met the target [1], Bergen missed it [2].\" Every source must be marked, "
                      "and each marker exactly once: one marker per claim. If two claims rest on the same evidence, "
                      "give each claim its own entry in `sources` (repeating the reference), so each claim can be "
-                     "reviewed separately."),
+                     "reviewed separately. Each claim is a SINGLE sentence or clause with its marker immediately "
+                     "after it; never let one marker cover several sentences (write \"The target is 45% [1]. It "
+                     "is defined as revenue minus cost over revenue [2].\", not one marker after both). Context "
+                     "sentences without facts need no marker, but every sentence that contains a number, "
+                     "percentage or date must carry its own marker."),
         input_schema=schema,
     )
 
@@ -204,4 +212,34 @@ def marker_errors(answer: dict) -> list[str]:
     if missing:
         errors.append(f"sources {', '.join(f'[{i}]' for i in missing)} are never referenced in the answer text; "
                       "put the marker right after the claim it supports")
+    return errors
+
+
+
+# ---------- facts without a marker ----------
+
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")                 # "41.83" is not a sentence end
+LIST_PREFIX = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")          # "- " or "1. " list bullets
+
+
+def unmarked_fact_errors(answer: dict) -> list[str]:
+    """A sentence that contains a number, percentage or date must carry a marker.
+
+    Catches claims whose marker sits after a later sentence ("Target is 45%. It is
+    defined as ... [1]."), so every fact gets its own reviewable marker.
+    Markdown headings are skipped; spelled-out numbers ("four") are not detected.
+    """
+    errors = []
+    for line in answer_text(answer).splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for sentence in SENTENCE_END.split(LIST_PREFIX.sub("", line)):   # drop "1. " before splitting
+            if MARKER.search(sentence):
+                continue
+            if re.search(r"\d", sentence):
+                shown = sentence.strip()
+                shown = shown if len(shown) <= 90 else shown[:87] + "..."
+                errors.append(f'sentence "{shown}" contains a number, percentage or date but has no marker. '
+                              "Make it its own claim: add an entry to sources and put [n] right after it, "
+                              "or remove the number if you have no evidence for it")
     return errors

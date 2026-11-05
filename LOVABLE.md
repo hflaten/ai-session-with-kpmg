@@ -174,7 +174,10 @@ The answer text cites inline: **`[n]` right after a claim, where `n` is the 1-ba
 - **each marker appears exactly once** — one marker is one claim, so each claim can be reviewed on
   its own. Two claims resting on the same evidence get **two entries** in `sources` (same
   document/page/chunk or table/SQL, different `claim`), as in the example above (`[1]` and `[2]`);
-- a claim backed by two sources gets two adjacent markers, `[1][2]` — still one claim.
+- a claim backed by two sources gets two adjacent markers, `[1][2]` — still one claim;
+- **each claim is a single sentence or clause, with its marker right after it** — a marker never
+  covers several sentences, and every sentence that contains a number, percentage or date has a
+  marker. Context sentences without facts have none. So a claim span never runs over a sentence end.
 
 Markers can appear in any text field of your schema, not only `answer`.
 

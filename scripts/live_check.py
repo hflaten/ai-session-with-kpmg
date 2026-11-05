@@ -107,6 +107,12 @@ def check_orchestrate(base):
         for s in done["answer"].get("sources", []):
             print("   -", f"{s['document_name']} p{s['page_number']} ({s['chunk_id']})" if "chunk_id" in s
                   else f"{s['table']}: {s['sql'][:90]}")
+        resolved = httpx.get(f"{base}/runs/{done['run_id']}/sources", headers=H, timeout=60).json()["sources"]
+        print("  resolved sources (GET /runs/{id}/sources):")
+        for s in resolved:
+            shown = (f"page text: {s['text'][:70]!r}" if s["kind"] == "document"
+                     else f"{s.get('row_count', 0)} rows, first: {s['rows'][:1]}")
+            print(f"   [{s['index']}] {s['kind']:8} {shown}" + (f"  ERROR {s['error']}" if s["error"] else ""))
         tree = httpx.get(f"{base}/runs/{done['run_id']}/tree", headers=H, timeout=60).json()
         print("  delegation tree (GET /runs/{id}/tree):")
 

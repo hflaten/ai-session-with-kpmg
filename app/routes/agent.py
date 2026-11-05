@@ -5,6 +5,7 @@ POST /agent/stream            same, but stream each step live (Server-Sent Event
 GET  /agent/stream            same, with ?task=... (for the browser's EventSource, which only does GET)
 GET  /runs/{id}               a logged run from agent_runs
 GET  /runs/{id}/tree          the run and the specialist runs it delegated to, nested
+GET  /runs/{id}/sources       the answer's sources with chunk text / re-run rows, for clickable citations
 GET  /approvals               runs currently waiting for a human decision
 POST /runs/{id}/approve       let the waiting action run      body: {"reason": "..."} (optional)
 POST /runs/{id}/reject        don't run it                     body: {"reason": "..."} (optional)
@@ -19,7 +20,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import runs
+from app import runs, sources
 from app.agent import approvals, service
 from app.agent.service import RunRequest
 from app.agent.structured import check_output_schema
@@ -98,6 +99,14 @@ def get_tree(run_id: UUID):
     if tree is None:
         raise HTTPException(404, "Run not found")
     return tree
+
+
+@router.get("/runs/{run_id}/sources")
+def get_sources(run_id: UUID):
+    resolved = sources.resolve_sources(str(run_id))
+    if resolved is None:
+        raise HTTPException(404, "Run not found")
+    return {"run_id": str(run_id), "sources": resolved}
 
 
 # ---------- human-in-the-loop ----------

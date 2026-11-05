@@ -90,6 +90,8 @@ Test document: `tests/fixtures/nordvik_q1_2026_report.pdf` (fictional, made by
 
 ## Endpoints (for the Lovable frontend)
 
+Frontend integration guide + ready-to-paste Lovable prompt: **`LOVABLE.md`**.
+
 **Auth:** every endpoint except `/health` needs header `X-API-Key: <APP_API_KEY>`
 (`app/auth.py`). For `EventSource`, which can't set headers, use `?api_key=...` instead.
 This only stops casual abuse — the token is visible in the frontend code. Rotate it
@@ -109,6 +111,7 @@ comments show up immediately. The list of uploaded documents (`describe_document
 | GET | `/agent/stream` | `?task=...&system_prompt=...&mode=...` | SSE stream — works with `new EventSource(url)` (no output_schema) |
 | GET | `/runs/{run_id}` | – | the logged row from `agent_runs` |
 | GET | `/runs/{run_id}/tree` | – | `{id, agent_name, task, status, duration_ms, children: [...]}` |
+| GET | `/runs/{run_id}/sources` | – | the answer's sources resolved: chunk `text`, or `columns`/`rows` from re-running the cited SQL as `agent_readonly` (`app/sources.py`) |
 | GET | `/approvals` | – | `{pending: [{run_id, tool, input, waiting_seconds}]}` |
 | POST | `/runs/{run_id}/approve` | `{reason?}` | `{run_id, decision: "approved"}`; 404 if the run isn't waiting |
 | POST | `/runs/{run_id}/reject` | `{reason?}` | `{run_id, decision: "rejected"}`; 404 if the run isn't waiting |

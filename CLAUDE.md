@@ -31,6 +31,7 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 
 - `agent_runs`: id, created_at, parent_run_id, agent_name, task, provider, model,
   status (running | awaiting_approval | completed | failed), answer, trace, error, duration_ms.
+- `sample_sales`: 24 rows of made-up demo data for testing query_database (drop before real use).
 - `agent_readonly` role: `SELECT` on `public` (including future tables, e.g. uploads),
   `default_transaction_read_only = on`, `statement_timeout = 10s`, no access to `agent_runs`.
   Its password is not in the migration; set it with `scripts/set_readonly_password.py`.
@@ -91,6 +92,6 @@ the first request after a sleep takes ~30–60 s, and any run waiting for approv
 
 - [x] 0a Repo (private, pushed)  - [x] 0b Supabase project, link, init migration
 - [x] 1 FastAPI skeleton         - [x] 2 LLM adapters (OpenAI live check pending credits)  - [x] 3 Agent loop
-- [ ] 4 query_database           - [ ] 5 Structured output - [ ] 6 SSE + run logging
+- [x] 4 query_database           - [ ] 5 Structured output - [ ] 6 SSE + run logging
 - [ ] 7 Uploads + RAG (approval checkpoint first) - [ ] 8 Human-in-the-loop
 - [ ] 9 Orchestrator             - [ ] 10 Deploy

@@ -3,6 +3,7 @@ from pydantic import BaseModel
 
 from app.agent import run_agent
 from app.llm import Tool
+from app.tools.database import query_database_tool
 
 router = APIRouter(prefix="/agent")
 
@@ -12,7 +13,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 # Tools available to /agent/run. Filled in by later steps (query_database, search_documents).
-TOOLS: list[Tool] = []
+TOOLS: list[Tool] = [query_database_tool]
 
 
 class RunRequest(BaseModel):

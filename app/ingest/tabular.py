@@ -20,7 +20,7 @@ from app import db
 from app.config import settings
 from app.ingest.table_layout import clean_sheet
 
-RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports"}  # never overwrite the backend's own tables
+RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports", "claim_reviews"}  # never overwrite the backend's own tables
 MAX_IDENTIFIER = 63                                   # Postgres name length limit
 
 

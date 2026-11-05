@@ -1,7 +1,7 @@
 """Reset the data before the hackathon.
 
 Always: drop every uploaded/demo table (including sample_sales), empty
-document_chunks and empty saved_reports. With --include-runs: also empty
+document_chunks, saved_reports and claim_reviews. With --include-runs: also empty
 agent_runs (the run log). The tables themselves, the read-only role and all
 other schema are kept.
 
@@ -19,7 +19,7 @@ from psycopg import sql
 
 from app import db
 
-KEEP = {"agent_runs", "document_chunks", "saved_reports"}  # the backend's own tables (emptied, not dropped)
+KEEP = {"agent_runs", "document_chunks", "saved_reports", "claim_reviews"}  # the backend's own tables (emptied, not dropped)
 
 
 def count(conn, table: str) -> int:
@@ -36,7 +36,7 @@ def tables_to_drop(conn) -> list[str]:
 def main() -> int:
     really = "--yes" in sys.argv
     include_runs = "--include-runs" in sys.argv
-    to_empty = ["document_chunks", "saved_reports"] + (["agent_runs"] if include_runs else [])
+    to_empty = ["document_chunks", "saved_reports", "claim_reviews"] + (["agent_runs"] if include_runs else [])
 
     with db.connect() as conn:  # one transaction: all or nothing
         to_drop = tables_to_drop(conn)

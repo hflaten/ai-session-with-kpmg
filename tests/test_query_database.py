@@ -77,3 +77,22 @@ def test_run_tree_nests_children():
     finally:
         with db.connect() as conn:  # children are deleted by the foreign key cascade
             conn.execute("delete from agent_runs where id = %s", (parent,))
+
+
+
+def test_latest_review_wins_and_history_is_kept():
+    """Live: two reviews of the same source -> the newest is current; deleting the run removes them."""
+    from app import db, reviews, runs
+    run = runs.create_run("review test")
+    try:
+        reviews.add_review(run, 0, "rejected", "Ana", "first look")
+        reviews.add_review(run, 0, "accepted", "Ana", "checked again")
+        reviews.add_review(run, 1, "rejected", None, None)
+        latest = reviews.latest_reviews(run)
+        assert latest[0]["decision"] == "accepted" and latest[0]["comment"] == "checked again"
+        assert latest[1]["decision"] == "rejected"
+        with db.connect() as conn:
+            assert conn.execute("select count(*) n from claim_reviews where run_id = %s", (run,)).fetchone()["n"] == 3
+    finally:
+        with db.connect() as conn:
+            conn.execute("delete from agent_runs where id = %s", (run,))   # reviews go with it (cascade)

@@ -5,7 +5,8 @@ POST /agent/stream            same, but stream each step live (Server-Sent Event
 GET  /agent/stream            same, with ?task=... (for the browser's EventSource, which only does GET)
 GET  /runs/{id}               a logged run from agent_runs
 GET  /runs/{id}/tree          the run and the specialist runs it delegated to, nested
-GET  /runs/{id}/sources       the answer's sources with chunk text / re-run rows, for clickable citations
+GET  /runs/{id}/sources       the answer's sources with chunk text / re-run rows, marker and latest review
+POST /runs/{id}/sources/{index}/review   accept/reject one source  body: {decision, reviewer?, comment?}
 GET  /approvals               runs currently waiting for a human decision
 POST /runs/{id}/approve       let the waiting action run      body: {"reason": "..."} (optional)
 POST /runs/{id}/reject        don't run it                     body: {"reason": "..."} (optional)
@@ -14,13 +15,14 @@ import asyncio
 import json
 import queue
 import threading
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import runs, sources
+from app import reviews, runs, sources
 from app.agent import approvals, service
 from app.agent.service import RunRequest
 from app.agent.structured import check_output_schema
@@ -106,7 +108,25 @@ def get_sources(run_id: UUID):
     resolved = sources.resolve_sources(str(run_id))
     if resolved is None:
         raise HTTPException(404, "Run not found")
-    return {"run_id": str(run_id), "sources": resolved}
+    return {"run_id": str(run_id), "summary": sources.review_summary(resolved), "sources": resolved}
+
+
+class Review(BaseModel):
+    decision: Literal["accepted", "rejected"]
+    reviewer: str | None = None
+    comment: str | None = None
+
+
+@router.post("/runs/{run_id}/sources/{index}/review")
+def review_source(run_id: UUID, index: int, body: Review):
+    """index is 0-based, like `index` in GET /runs/{id}/sources (marker [n] = index + 1)."""
+    count = sources.source_count(str(run_id))
+    if count is None:
+        raise HTTPException(404, "Run not found")
+    if not 0 <= index < count:
+        raise HTTPException(404, f"This run has {count} sources; index must be 0 to {count - 1}")
+    review = reviews.add_review(str(run_id), index, body.decision, body.reviewer, body.comment)
+    return {"run_id": str(run_id), "index": index, "marker": index + 1, "review": review}
 
 
 # ---------- human-in-the-loop ----------

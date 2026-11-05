@@ -7,8 +7,10 @@
 
 Only SQL stored in the run's validated answer is re-run (it passed the citation
 check, so the agent really ran it). The browser never sends SQL.
+
+Each source also gets its inline `marker` ([n] = index + 1) and its latest human `review`.
 """
-from app import db, runs
+from app import db, reviews, runs
 from app.tools.database import query_database
 
 
@@ -27,17 +29,35 @@ def resolve_sources(run_id: str) -> list[dict] | None:
     if not isinstance(answer, dict):
         return []
 
+    latest = reviews.latest_reviews(run_id)
     resolved = []
     for i, s in enumerate(answer.get("sources", [])):
+        base = {"index": i, "marker": i + 1, "review": latest.get(i)}
         if "chunk_id" in s:
             text = _chunk_text(s["chunk_id"])
-            resolved.append({"index": i, "kind": "document", **s, "text": text,
+            resolved.append({**base, "kind": "document", **s, "text": text,
                              "error": None if text is not None else "chunk no longer exists (document re-uploaded or reset)"})
         elif "sql" in s:
             try:
                 result = query_database(s["sql"])
-                resolved.append({"index": i, "kind": "database", **s, **result, "error": None})
+                resolved.append({**base, "kind": "database", **s, **result, "error": None})
             except Exception as e:
-                resolved.append({"index": i, "kind": "database", **s, "columns": [], "rows": [],
+                resolved.append({**base, "kind": "database", **s, "columns": [], "rows": [],
                                  "error": f"{type(e).__name__}: {e}"})
     return resolved
+
+
+def review_summary(resolved: list[dict]) -> dict:
+    """{total, accepted, rejected, unreviewed} for a progress bar ("3 of 7 claims verified")."""
+    decisions = [s["review"]["decision"] if s["review"] else None for s in resolved]
+    return {"total": len(decisions), "accepted": decisions.count("accepted"),
+            "rejected": decisions.count("rejected"), "unreviewed": decisions.count(None)}
+
+
+def source_count(run_id: str) -> int | None:
+    """Number of sources in a run's structured answer; None if the run doesn't exist."""
+    run = runs.get_run(run_id)
+    if run is None:
+        return None
+    answer = run.get("answer")
+    return len(answer.get("sources", [])) if isinstance(answer, dict) else 0

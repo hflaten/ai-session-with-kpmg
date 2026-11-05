@@ -39,3 +39,26 @@ def finish_run(run_id: str, status: str, trace: list, answer=None, error: str | 
 def get_run(run_id: str) -> dict | None:
     with db.connect() as conn:
         return conn.execute("select * from agent_runs where id = %s", (run_id,)).fetchone()
+
+
+def get_tree(run_id: str) -> dict | None:
+    """The run and all runs it delegated to, nested: {id, agent_name, status, task, ..., children: [...]}."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            """with recursive tree as (
+                   select * from agent_runs where id = %s
+                   union all
+                   select r.* from agent_runs r join tree t on r.parent_run_id = t.id
+               )
+               select id, parent_run_id, agent_name, task, status, duration_ms, created_at
+               from tree order by created_at""",
+            (run_id,),
+        ).fetchall()
+    if not rows:
+        return None
+    nodes = {str(r["id"]): {**r, "id": str(r["id"]), "children": []} for r in rows}
+    for node in nodes.values():
+        parent = node["parent_run_id"] and str(node["parent_run_id"])
+        if parent in nodes:
+            nodes[parent]["children"].append(node)
+    return nodes[run_id]

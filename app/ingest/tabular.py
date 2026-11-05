@@ -16,7 +16,7 @@ from sqlalchemy import create_engine
 from app import db
 from app.config import settings
 
-RESERVED_TABLES = {"agent_runs", "document_chunks"}  # never overwrite the backend's own tables
+RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports"}  # never overwrite the backend's own tables
 MAX_IDENTIFIER = 63                                   # Postgres name length limit
 
 

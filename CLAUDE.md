@@ -20,11 +20,12 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 | DB | `app/db.py` | `connect(readonly=False)`. Read-only URL only for the SQL tool. |
 | LLM adapters | `app/llm/` | One `call_llm()`; tools defined once (name, description, input schema); adapters translate to Anthropic / OpenAI format. `LLM_PROVIDER` picks one. |
 | Agent loop | `app/agent/loop.py` | `run_agent(system_prompt, tools, task)`: call LLM → run tools → repeat, max 10 steps. Returns answer + trace. |
+| Run service | `app/agent/service.py` | `execute()`: logs the run, builds prompt + tools, wires approvals. Used by `/agent/run` and `/agent/stream`. |
 | Tools | `app/tools/` | `query_database` (read-only SQL), `search_documents` (pgvector). |
 | Structured output | `app/agent/structured.py` | Final answer is a `submit_answer` tool call whose schema is the requested JSON schema + a required `sources` list. Citations are checked against what the agent actually found this run. Works on both providers. |
 | Streaming | `app/routes/` | SSE, one event per agent step. Every run logged to `agent_runs`. |
 | Ingest | `app/ingest/` | CSV/Excel → own table via pandas, with table + column comments; PDF → per-page chunks → embeddings → `document_chunks`. |
-| Human-in-the-loop | `app/agent/approvals.py` | Tools flagged `requires_approval` pause the run until `/runs/{id}/approve` or `/reject`. Held in memory → single worker. |
+| Human-in-the-loop | `app/agent/approvals.py` | Tools flagged `requires_approval` (only `save_report`) pause the run until `/runs/{id}/approve` or `/reject` (10 min timeout = rejected). The request is registered *before* it is announced, so an instant click is never lost. Held in memory → single worker. |
 | Orchestrator | `app/agent/orchestrator.py` | Orchestrator's tools call `run_agent` for two specialists. Trace nests specialist traces; `agent_runs.parent_run_id` links them. |
 
 ### Database (supabase/migrations)
@@ -32,6 +33,8 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 - `agent_runs`: id, created_at, parent_run_id, agent_name, task, provider, model,
   status (running | awaiting_approval | completed | failed), answer, trace, error, duration_ms.
 - `sample_sales`: 24 rows of made-up demo data for testing query_database (drop before real use).
+- `saved_reports`: id, created_at, run_id, title, content. Written only by `save_report` after a human
+  approves. RLS on, with a read policy for `agent_readonly`. Kept by the reset script.
 - `document_chunks`: chunk_id (`file:p<page>:c<index>`), document_name, page_number, chunk_index,
   text, embedding `vector(1536)` with an HNSW cosine index. Not readable by `agent_readonly`;
   `search_documents` reads it with a fixed query. Re-uploading a file name replaces its chunks.
@@ -105,12 +108,17 @@ comments show up immediately. The list of uploaded documents (`describe_document
 | POST | `/agent/stream` | same JSON body | SSE stream (below) — read with `fetch` + `response.body.getReader()` |
 | GET | `/agent/stream` | `?task=...&system_prompt=...` | SSE stream — works with `new EventSource(url)` (no output_schema) |
 | GET | `/runs/{run_id}` | – | the logged row from `agent_runs` |
+| GET | `/approvals` | – | `{pending: [{run_id, tool, input, waiting_seconds}]}` |
+| POST | `/runs/{run_id}/approve` | `{reason?}` | `{run_id, decision: "approved"}`; 404 if the run isn't waiting |
+| POST | `/runs/{run_id}/reject` | `{reason?}` | `{run_id, decision: "rejected"}`; 404 if the run isn't waiting |
 | POST | `/upload/table` | multipart: `file` (.csv/.xlsx), `column_descriptions?` (JSON string) | `{tables: [{table, rows, comment, columns}], unused_column_descriptions}` |
 | POST | `/upload/pdf` | multipart: `file` (.pdf, max 20 MB) | `{document_name, pages, chunks}` |
 
 SSE events, in order: `run_started` `{run_id}` → one `step` per trace entry
-(`type`: `llm` | `tool` | `final_answer`) → `done` `{run_id, answer, stopped_reason, trace}`,
-or `error` `{error}` if the run crashed.
+(`type`: `llm` | `tool` | `approval` | `final_answer`) → `done` `{run_id, answer, stopped_reason, trace}`,
+or `error` `{error}` if the run crashed. When a flagged tool is called, an `approval_required`
+event `{run_id, tool, input}` arrives and the stream pauses until `/runs/{run_id}/approve` or `/reject`;
+then a `step` with `type: "approval"` `{decision, reason, waited_ms}` follows.
 
 `answer` is a string, or an object matching `output_schema` when one is given
 (it must have `"type": "object"` at the top level and must not define `sources` itself —
@@ -146,6 +154,16 @@ commit/push if `.env` is staged or if any secret value from `.env` (names ending
 SECRET, TOKEN, DB_URL) appears in the staged diff or in the commits being pushed. It prints variable
 names, never values. Enable once per clone with `git config core.hooksPath .githooks`.
 The pre-push check also catches commits made with `git commit --no-verify`.
+
+## Live checks
+
+```bash
+.venv/bin/python -u -m scripts.live_check https://ai-session-with-kpmg.onrender.com          # all checks
+.venv/bin/python -u -m scripts.live_check http://localhost:8000 health stream approve reject # some
+```
+
+Runs health, a full run, stream timing, approve/reject flows and the orchestrator against a running
+backend, printing a timeline. Note: `approve` saves a real row in `saved_reports`.
 
 ## Reset data before the hackathon
 
@@ -193,5 +211,5 @@ the first request after a sleep takes ~30–60 s, and any run waiting for approv
 - [x] 0a Repo (private, pushed)  - [x] 0b Supabase project, link, init migration
 - [x] 1 FastAPI skeleton         - [x] 2 LLM adapters  - [x] 3 Agent loop
 - [x] 4 query_database           - [x] 5 Structured output - [x] 6 SSE + run logging
-- [x] 7 Uploads + RAG - [ ] 8 Human-in-the-loop
+- [x] 7 Uploads + RAG - [x] 8 Human-in-the-loop
 - [ ] 9 Orchestrator             - [x] 10 Deploy

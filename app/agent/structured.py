@@ -100,18 +100,33 @@ def normalize_sql(sql: str) -> str:
 
 
 class Evidence:
-    """What the agent actually saw in this run: chunks found and SQL that ran."""
+    """What the agent actually saw in this run: chunks found and SQL that ran.
+
+    For the orchestrator, this also includes what its specialists found
+    (delegation tools return `chunks_found` and `sql_run`).
+    """
 
     def __init__(self) -> None:
         self.chunks: dict[str, dict] = {}   # chunk_id -> {document_name, page_number}
-        self.sql: set[str] = set()          # normalized SQL of successful queries
+        self.sql: dict[str, str] = {}       # normalized SQL -> SQL as written, for successful queries
 
     def add(self, tool_name: str, args: dict, output) -> None:
         if tool_name == "search_documents":
             for r in output["results"]:
                 self.chunks[r["chunk_id"]] = {"document_name": r["document_name"], "page_number": r["page_number"]}
         elif tool_name == "query_database":
-            self.sql.add(normalize_sql(args["sql"]))
+            self.sql[normalize_sql(args["sql"])] = args["sql"]
+        elif isinstance(output, dict) and "chunks_found" in output:  # a specialist's report
+            for c in output["chunks_found"]:
+                self.chunks[c["chunk_id"]] = {"document_name": c["document_name"], "page_number": c["page_number"]}
+            for sql in output["sql_run"]:
+                self.sql[normalize_sql(sql)] = sql
+
+    def chunk_list(self) -> list[dict]:
+        return [{"chunk_id": cid, **ref} for cid, ref in self.chunks.items()]
+
+    def sql_list(self) -> list[str]:
+        return list(self.sql.values())
 
 
 def _table_in_sql(table: str, sql: str) -> bool:

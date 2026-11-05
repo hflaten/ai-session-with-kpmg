@@ -1,16 +1,17 @@
-"""Agent endpoints.
+"""Agent endpoints (HTTP only; the logic is in app/agent/service.py).
 
-POST /agent/run      run to completion, return answer + trace
-POST /agent/stream   same, but stream each step live (Server-Sent Events)
-GET  /agent/stream   same, with ?task=... (for the browser's EventSource, which only does GET)
-GET  /runs/{id}      a logged run from agent_runs
+POST /agent/run               run to completion, return answer + trace
+POST /agent/stream            same, but stream each step live (Server-Sent Events)
+GET  /agent/stream            same, with ?task=... (for the browser's EventSource, which only does GET)
+GET  /runs/{id}               a logged run from agent_runs
+GET  /approvals               runs currently waiting for a human decision
+POST /runs/{id}/approve       let the waiting action run      body: {"reason": "..."} (optional)
+POST /runs/{id}/reject        don't run it                     body: {"reason": "..."} (optional)
 """
 import asyncio
 import json
 import queue
 import threading
-import time
-from typing import Callable
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException
@@ -18,27 +19,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import runs
-from app.agent import run_agent
+from app.agent import approvals, service
+from app.agent.service import RunRequest
 from app.agent.structured import check_output_schema
-from app.llm import Tool
-from app.tools.database import describe_schema, query_database_tool
-from app.tools.documents import describe_documents, search_documents_tool
 
 router = APIRouter()
 
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful analyst. Use the available tools when they help. "
-    "Be concise and say when you are unsure."
-)
-
-# Tools available to the agent.
-TOOLS: list[Tool] = [query_database_tool, search_documents_tool]
-
-
-class RunRequest(BaseModel):
-    task: str
-    system_prompt: str | None = None
-    output_schema: dict | None = None   # JSON schema for a structured answer
+# Event types that get their own SSE event name; every other trace entry is sent as "step"
+NAMED_EVENTS = {"run_started", "approval_required", "done", "error"}
 
 
 def _validate(req: RunRequest) -> None:
@@ -49,52 +37,10 @@ def _validate(req: RunRequest) -> None:
             raise HTTPException(400, f"Invalid output_schema: {e}")
 
 
-def build_system_prompt(custom: str | None) -> str:
-    """Caller's prompt (or the default) + the current tables and documents.
-
-    Read fresh each run (no caching), so new uploads show up immediately.
-    If the database is unreachable the agent still runs, just without them.
-    """
-    parts = [custom or DEFAULT_SYSTEM_PROMPT]
-    for describe in (describe_schema, describe_documents):
-        try:
-            parts.append(describe())
-        except Exception:
-            pass
-    return "\n\n".join(parts)
-
-
-def execute(req: RunRequest, on_event: Callable[[dict], None] | None = None) -> dict:
-    """Run the agent and log it to agent_runs. Shared by /run and /stream."""
-    emit = on_event or (lambda e: None)
-    run_id = runs.create_run(req.task)
-    emit({"type": "run_started", "run_id": run_id})
-    started = time.monotonic()
-    trace: list[dict] = []
-
-    def on_step(entry: dict) -> None:
-        trace.append(entry)
-        emit(entry)
-
-    try:
-        result = run_agent(build_system_prompt(req.system_prompt), TOOLS, req.task,
-                           output_schema=req.output_schema, on_event=on_step)
-    except Exception as e:
-        runs.finish_run(run_id, "failed", trace, error=f"{type(e).__name__}: {e}",
-                        duration_ms=int((time.monotonic() - started) * 1000))
-        raise
-    status = "completed" if result.stopped_reason == "answered" else "failed"
-    runs.finish_run(run_id, status, result.trace, answer=result.answer,
-                    error=None if status == "completed" else result.answer,
-                    duration_ms=int((time.monotonic() - started) * 1000))
-    return {"run_id": run_id, "answer": result.answer,
-            "stopped_reason": result.stopped_reason, "trace": result.trace}
-
-
 @router.post("/agent/run")
 def run(req: RunRequest):
     _validate(req)
-    return execute(req)
+    return service.execute(req)
 
 
 def _sse(event: str, data) -> str:
@@ -108,7 +54,7 @@ def _stream(req: RunRequest) -> StreamingResponse:
 
     def worker():
         try:
-            result = execute(req, on_event=events.put)
+            result = service.execute(req, on_event=events.put)
             events.put({"type": "done", **result})
         except Exception as e:
             events.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
@@ -119,8 +65,7 @@ def _stream(req: RunRequest) -> StreamingResponse:
 
     async def body():
         while (event := await asyncio.to_thread(events.get)) is not None:
-            name = event["type"] if event["type"] in ("run_started", "done", "error") else "step"
-            yield _sse(name, event)
+            yield _sse(event["type"] if event["type"] in NAMED_EVENTS else "step", event)
 
     return StreamingResponse(body(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -142,3 +87,30 @@ def get_run(run_id: UUID):
     if row is None:
         raise HTTPException(404, "Run not found")
     return row
+
+
+# ---------- human-in-the-loop ----------
+
+class Decision(BaseModel):
+    reason: str = ""
+
+
+@router.get("/approvals")
+def pending_approvals():
+    return {"pending": approvals.list_pending()}
+
+
+def _decide(run_id: UUID, approved: bool, body: Decision | None):
+    if not approvals.decide(str(run_id), approved, body.reason if body else ""):
+        raise HTTPException(404, "This run is not waiting for an approval")
+    return {"run_id": str(run_id), "decision": "approved" if approved else "rejected"}
+
+
+@router.post("/runs/{run_id}/approve")
+def approve(run_id: UUID, body: Decision | None = None):
+    return _decide(run_id, True, body)
+
+
+@router.post("/runs/{run_id}/reject")
+def reject(run_id: UUID, body: Decision | None = None):
+    return _decide(run_id, False, body)

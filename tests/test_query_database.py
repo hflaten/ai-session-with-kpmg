@@ -2,7 +2,7 @@
 import pytest
 
 from app.config import settings
-from app.routes import agent as agent_routes
+from app.agent import service
 from app.tools.database import MAX_ROWS, describe_schema, query_database
 
 pytestmark = pytest.mark.skipif(not settings.readonly_db_url, reason="no SUPABASE_READONLY_DB_URL")
@@ -58,6 +58,6 @@ def test_schema_is_read_fresh_each_call():
 def test_system_prompt_survives_db_failure(monkeypatch):
     def boom():
         raise ConnectionError("db down")
-    monkeypatch.setattr(agent_routes, "describe_schema", boom)
-    monkeypatch.setattr(agent_routes, "describe_documents", boom)
-    assert agent_routes.build_system_prompt("Be brief.") == "Be brief."
+    monkeypatch.setattr(service, "describe_schema", boom)
+    monkeypatch.setattr(service, "describe_documents", boom)
+    assert service.build_system_prompt("Be brief.") == "Be brief."

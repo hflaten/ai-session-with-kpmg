@@ -1,5 +1,5 @@
 """Reset the data before the hackathon: drop every uploaded/demo table
-(including sample_sales) and empty document_chunks. Keeps agent_runs, the
+(including sample_sales) and empty document_chunks. Keeps agent_runs, saved_reports, the
 document_chunks table itself, the read-only role and all other schema.
 
     .venv/bin/python -m scripts.reset_data          # dry run: shows what would be deleted
@@ -14,7 +14,7 @@ from psycopg import sql
 
 from app import db
 
-KEEP = {"agent_runs", "document_chunks"}  # the backend's own tables
+KEEP = {"agent_runs", "document_chunks", "saved_reports"}  # the backend's own tables
 
 
 def plan(conn) -> tuple[list[str], int]:

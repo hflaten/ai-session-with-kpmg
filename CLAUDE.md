@@ -61,6 +61,14 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 
 ## Endpoints (for the Lovable frontend)
 
+**Auth:** every endpoint except `/health` needs header `X-API-Key: <APP_API_KEY>`
+(`app/auth.py`). For `EventSource`, which can't set headers, use `?api_key=...` instead.
+This only stops casual abuse — the token is visible in the frontend code. Rotate it
+(and the LLM keys) after the hackathon. If `APP_API_KEY` is unset the API returns 503 (fails closed).
+
+**Schema in the prompt:** at the start of each run, the tables the agent can read are appended
+to the system prompt (`describe_schema()` in `app/tools/database.py`), so it skips the lookup step.
+
 | Method | Path | Body / params | Returns |
 |---|---|---|---|
 | GET | `/health` | – | `{status, llm_provider, llm_model, database}` |

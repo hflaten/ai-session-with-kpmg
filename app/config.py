@@ -35,6 +35,7 @@ class Settings:
     db_url: str
     readonly_db_url: str
     allowed_origins: list[str]
+    app_api_key: str                # shared token the frontend sends as X-API-Key
 
     @property
     def llm_model(self) -> str:
@@ -55,6 +56,7 @@ def load_settings() -> Settings:
         db_url=_get("SUPABASE_DB_URL"),
         readonly_db_url=_get("SUPABASE_READONLY_DB_URL"),
         allowed_origins=[o.strip() for o in _get("ALLOWED_ORIGINS").split(",") if o.strip()],
+        app_api_key=_get("APP_API_KEY"),
     )
 
 

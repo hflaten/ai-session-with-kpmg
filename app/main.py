@@ -2,9 +2,10 @@
 
     .venv/bin/uvicorn app.main:app --reload
 """
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.auth import require_api_key
 from app.config import cors_origin_regex, settings
 from app.routes import agent, health
 
@@ -18,5 +19,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(health.router)
-app.include_router(agent.router)
+app.include_router(health.router)                                          # open
+app.include_router(agent.router, dependencies=[Depends(require_api_key)])  # needs X-API-Key

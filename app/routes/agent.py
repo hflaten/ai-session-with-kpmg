@@ -21,7 +21,7 @@ from app import runs
 from app.agent import run_agent
 from app.agent.structured import check_output_schema
 from app.llm import Tool
-from app.tools.database import query_database_tool
+from app.tools.database import describe_schema, query_database_tool
 
 router = APIRouter()
 
@@ -48,6 +48,19 @@ def _validate(req: RunRequest) -> None:
             raise HTTPException(400, f"Invalid output_schema: {e}")
 
 
+def build_system_prompt(custom: str | None) -> str:
+    """Caller's prompt (or the default) + the current table schemas.
+
+    The schema is read fresh each run, so newly uploaded tables show up.
+    If the database is unreachable the agent still runs, just without it.
+    """
+    base = custom or DEFAULT_SYSTEM_PROMPT
+    try:
+        return f"{base}\n\n{describe_schema()}"
+    except Exception:
+        return base
+
+
 def execute(req: RunRequest, on_event: Callable[[dict], None] | None = None) -> dict:
     """Run the agent and log it to agent_runs. Shared by /run and /stream."""
     emit = on_event or (lambda e: None)
@@ -61,7 +74,7 @@ def execute(req: RunRequest, on_event: Callable[[dict], None] | None = None) -> 
         emit(entry)
 
     try:
-        result = run_agent(req.system_prompt or DEFAULT_SYSTEM_PROMPT, TOOLS, req.task,
+        result = run_agent(build_system_prompt(req.system_prompt), TOOLS, req.task,
                            output_schema=req.output_schema, on_event=on_step)
     except Exception as e:
         runs.finish_run(run_id, "failed", trace, error=f"{type(e).__name__}: {e}",

@@ -34,13 +34,40 @@ def query_database(sql: str) -> dict:
         }
 
 
+MAX_SCHEMA_TABLES = 50
+
+
+def describe_schema() -> str:
+    """List the tables the agent can read, for its system prompt.
+
+    Uses the read-only connection, so it shows exactly what query_database can see.
+    Saves the agent a tool call to discover the schema itself.
+    """
+    with db.connect(readonly=True) as conn:
+        rows = conn.execute(
+            """select c.table_name,
+                      string_agg(c.column_name || ' ' || c.data_type, ', ' order by c.ordinal_position) as columns,
+                      obj_description(format('public.%%I', c.table_name)::regclass) as comment
+               from information_schema.columns c
+               where c.table_schema = 'public'
+               group by c.table_name
+               order by c.table_name
+               limit %s""",
+            (MAX_SCHEMA_TABLES,),
+        ).fetchall()
+    if not rows:
+        return "The database has no tables yet."
+    lines = [f"- {r['table_name']}({r['columns']})" + (f"  -- {r['comment']}" if r["comment"] else "")
+             for r in rows]
+    return "Tables you can query with query_database (schema 'public'):\n" + "\n".join(lines)
+
+
 query_database_tool = Tool(
     name="query_database",
     description=(
         "Run one read-only PostgreSQL SELECT query and get the rows back as JSON "
-        f"(max {MAX_ROWS} rows). Data tables are in the 'public' schema. If you don't know "
-        "the tables yet, first run: select table_name, column_name, data_type from "
-        "information_schema.columns where table_schema = 'public' order by table_name, ordinal_position. "
+        f"(max {MAX_ROWS} rows). The available tables and columns are listed in your instructions; "
+        "only query information_schema if a table you need is not listed. "
         "Aggregate in SQL (sum, avg, group by) rather than fetching raw rows."
     ),
     input_schema={

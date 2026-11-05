@@ -165,7 +165,20 @@ Cannot be undone, and `supabase db push` will not recreate `sample_sales` (its m
    `OPENAI_API_KEY`, `OPENAI_MODEL`, `SUPABASE_DB_URL`, `SUPABASE_READONLY_DB_URL`, `APP_API_KEY`.
    The other 5 (`LLM_PROVIDER`, `OPENAI_BASE_URL`, `OPENAI_REASONING_EFFORT`, `EMBEDDING_MODEL`,
    `ALLOWED_ORIGINS`) plus `PYTHON_VERSION` are set by `render.yaml`.
-3. Test: `curl https://<service>.onrender.com/health` → `"status":"ok","database":"ok"`.
+3. Test: `curl https://ai-session-with-kpmg.onrender.com/health` → `"status":"ok","database":"ok"`.
+4. If `/health` shows `"llm_model":"(not set)"` / `"database":"unreachable"` and other endpoints
+   return 503, the secret env vars are missing: add them and choose **Save, rebuild, and deploy**.
+
+**Live URL:** https://ai-session-with-kpmg.onrender.com — verified 2026-11-05: `/health` ok,
+structured `/agent/run` with both tools and cited sources (10 s), POST and GET `/agent/stream`
+arrive live through Render's proxy (no buffering), runs logged in `agent_runs`.
+
+```bash
+curl https://ai-session-with-kpmg.onrender.com/health
+curl -X POST https://ai-session-with-kpmg.onrender.com/agent/run \
+  -H "X-API-Key: $APP_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"task": "Total revenue per region in Q1 2026?"}'
+```
 
 Deliberately **not** on Render: Supabase URL, anon key, service role key, DB password, project ref.
 The backend never reads them (it only uses the two connection strings), so the service role key
@@ -181,4 +194,4 @@ the first request after a sleep takes ~30–60 s, and any run waiting for approv
 - [x] 1 FastAPI skeleton         - [x] 2 LLM adapters  - [x] 3 Agent loop
 - [x] 4 query_database           - [x] 5 Structured output - [x] 6 SSE + run logging
 - [x] 7 Uploads + RAG - [ ] 8 Human-in-the-loop
-- [ ] 9 Orchestrator             - [ ] 10 Deploy
+- [ ] 9 Orchestrator             - [x] 10 Deploy

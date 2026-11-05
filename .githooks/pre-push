@@ -1,0 +1,11 @@
+#!/bin/sh
+# Refuse the push if any commit being pushed contains a secret from .env.
+# git passes: <local ref> <local sha> <remote ref> <remote sha> per line on stdin.
+zero=0000000000000000000000000000000000000000
+while read local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue                  # deleting a branch
+    if [ "$remote_sha" = "$zero" ]; then range="$local_sha"  # new branch: whole history
+    else range="$remote_sha..$local_sha"; fi
+    python3 scripts/check_secrets.py push "$range" || exit 1
+done
+exit 0

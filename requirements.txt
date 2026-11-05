@@ -15,7 +15,8 @@ jsonschema>=4.20        # validates structured answers
 
 # uploads and RAG
 pandas>=2.2
-openpyxl>=3.1           # Excel support for pandas
+openpyxl>=3.1           # .xlsx support for pandas
+xlrd>=2.0               # old .xls support for pandas
 pypdf>=5.0              # PDF text extraction
 
 # tests and scripts

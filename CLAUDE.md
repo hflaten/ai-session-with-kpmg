@@ -125,6 +125,7 @@ for tool calls on Chat Completions.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env          # then fill in values (Claude filled the Supabase ones)
+git config core.hooksPath .githooks   # once per clone: enables the secret-scan hooks
 .venv/bin/pytest -q
 .venv/bin/uvicorn app.main:app --reload
 curl localhost:8000/health
@@ -138,11 +139,37 @@ SUPABASE_DB_PASSWORD=... supabase db push --remote
 .venv/bin/python scripts/set_readonly_password.py   # only if the role was (re)created
 ```
 
+## Secret scan (git hooks)
+
+`.githooks/pre-commit` and `.githooks/pre-push` run `scripts/check_secrets.py`, which blocks the
+commit/push if `.env` is staged or if any secret value from `.env` (names ending in KEY, PASSWORD,
+SECRET, TOKEN, DB_URL) appears in the staged diff or in the commits being pushed. It prints variable
+names, never values. Enable once per clone with `git config core.hooksPath .githooks`.
+The pre-push check also catches commits made with `git commit --no-verify`.
+
+## Reset data before the hackathon
+
+```bash
+.venv/bin/python -m scripts.reset_data          # dry run: lists what would be deleted
+.venv/bin/python -m scripts.reset_data --yes    # drops all uploaded/demo tables (incl. sample_sales)
+                                                # and empties document_chunks; keeps agent_runs + schema
+```
+
+Cannot be undone, and `supabase db push` will not recreate `sample_sales` (its migration stays applied).
+
 ## Deploy (Render)
 
-1. Render dashboard → New → Blueprint → select `hflaten/ai-session-with-kpmg`; it reads `render.yaml`.
-2. Paste the env vars marked `sync: false` (same values as `.env`).
+1. Render dashboard → **New → Blueprint** → connect GitHub and select `hflaten/ai-session-with-kpmg`.
+   It reads `render.yaml`: free plan, Frankfurt, Python 3.13.1, health check `/health`, 1 worker.
+2. Paste the 7 secret env vars (same values as `.env`): `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`,
+   `OPENAI_API_KEY`, `OPENAI_MODEL`, `SUPABASE_DB_URL`, `SUPABASE_READONLY_DB_URL`, `APP_API_KEY`.
+   The other 5 (`LLM_PROVIDER`, `OPENAI_BASE_URL`, `OPENAI_REASONING_EFFORT`, `EMBEDDING_MODEL`,
+   `ALLOWED_ORIGINS`) plus `PYTHON_VERSION` are set by `render.yaml`.
 3. Test: `curl https://<service>.onrender.com/health` → `"status":"ok","database":"ok"`.
+
+Deliberately **not** on Render: Supabase URL, anon key, service role key, DB password, project ref.
+The backend never reads them (it only uses the two connection strings), so the service role key
+can't leak from the server. They're only needed locally (Supabase CLI, scripts).
 
 Notes: the database URLs use the Supabase **session pooler** (`aws-1-eu-central-1.pooler.supabase.com`)
 because the direct DB host is IPv6-only and Render can't reach it. The free plan sleeps when idle;

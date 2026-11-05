@@ -80,17 +80,22 @@ def test_run_tree_nests_children():
 
 
 
-def test_latest_review_wins_and_history_is_kept():
-    """Live: two reviews of the same source -> the newest is current; deleting the run removes them."""
+def test_review_snapshot_latest_wins_and_history_is_kept():
+    """Live: reviews store a self-contained snapshot; the newest per claim is current."""
     from app import db, reviews, runs
+    doc = {"claim": "Target is 45%", "document_name": "r.pdf", "page_number": 1, "chunk_id": "r.pdf:p1:c0"}
+    sql_src = {"claim": "Oslo 46%", "table": "sample_sales", "sql": "select 1"}
     run = runs.create_run("review test")
     try:
-        reviews.add_review(run, 0, "rejected", "Ana", "first look")
-        reviews.add_review(run, 0, "accepted", "Ana", "checked again")
-        reviews.add_review(run, 1, "rejected", None, None)
+        first = reviews.add_review(run, 1, doc, "rejected", "Ana", "first look")
+        assert first["marker"] == 1 and first["claim"] == "Target is 45%" and first["source_kind"] == "document"
+        assert (first["document_name"], first["page_number"], first["chunk_id"]) == ("r.pdf", 1, "r.pdf:p1:c0")
+        reviews.add_review(run, 1, doc, "accepted", "Ana", "checked again")
+        db_review = reviews.add_review(run, 2, sql_src, "rejected", None, None)
+        assert (db_review["source_kind"], db_review["table_name"], db_review["sql_query"]) == ("database", "sample_sales", "select 1")
         latest = reviews.latest_reviews(run)
-        assert latest[0]["decision"] == "accepted" and latest[0]["comment"] == "checked again"
-        assert latest[1]["decision"] == "rejected"
+        assert latest[1]["decision"] == "accepted" and latest[1]["comment"] == "checked again"
+        assert latest[2]["decision"] == "rejected"
         with db.connect() as conn:
             assert conn.execute("select count(*) n from claim_reviews where run_id = %s", (run,)).fetchone()["n"] == 3
     finally:

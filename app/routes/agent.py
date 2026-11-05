@@ -6,7 +6,7 @@ GET  /agent/stream            same, with ?task=... (for the browser's EventSourc
 GET  /runs/{id}               a logged run from agent_runs
 GET  /runs/{id}/tree          the run and the specialist runs it delegated to, nested
 GET  /runs/{id}/sources       the answer's sources with chunk text / re-run rows, marker and latest review
-POST /runs/{id}/sources/{index}/review   accept/reject one source  body: {decision, reviewer?, comment?}
+POST /runs/{id}/claims/{marker}/review   accept/reject one claim ([marker] in the text, 1-based)
 GET  /approvals               runs currently waiting for a human decision
 POST /runs/{id}/approve       let the waiting action run      body: {"reason": "..."} (optional)
 POST /runs/{id}/reject        don't run it                     body: {"reason": "..."} (optional)
@@ -117,16 +117,17 @@ class Review(BaseModel):
     comment: str | None = None
 
 
-@router.post("/runs/{run_id}/sources/{index}/review")
-def review_source(run_id: UUID, index: int, body: Review):
-    """index is 0-based, like `index` in GET /runs/{id}/sources (marker [n] = index + 1)."""
-    count = sources.source_count(str(run_id))
-    if count is None:
+@router.post("/runs/{run_id}/claims/{marker}/review")
+def review_claim(run_id: UUID, marker: int, body: Review):
+    """Accept or reject one claim. marker is the [n] in the answer text (1-based)."""
+    cited = sources.answer_sources(str(run_id))
+    if cited is None:
         raise HTTPException(404, "Run not found")
-    if not 0 <= index < count:
-        raise HTTPException(404, f"This run has {count} sources; index must be 0 to {count - 1}")
-    review = reviews.add_review(str(run_id), index, body.decision, body.reviewer, body.comment)
-    return {"run_id": str(run_id), "index": index, "marker": index + 1, "review": review}
+    if not 1 <= marker <= len(cited):
+        raise HTTPException(404, f"This answer has {len(cited)} claims; marker must be 1 to {len(cited)}"
+                                 if cited else "This answer has no cited claims")
+    review = reviews.add_review(str(run_id), marker, cited[marker - 1], body.decision, body.reviewer, body.comment)
+    return {"run_id": str(run_id), "marker": marker, "review": review}
 
 
 # ---------- human-in-the-loop ----------

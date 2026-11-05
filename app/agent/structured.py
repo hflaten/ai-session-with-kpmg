@@ -16,8 +16,10 @@ and page), and the sql must be a query_database call that succeeded, with the
 table appearing in it.
 
 The answer text must also cite inline: "Oslo met the target [1], Bergen missed it [2]."
-[n] is the 1-based position in `sources`. Every marker must point to a source and
-every source must be referenced at least once (marker_errors).
+[n] is the 1-based position in `sources`. Every marker must point to a source, every
+source must be referenced, and each marker appears exactly once: one marker = one claim,
+so each claim can be reviewed on its own. Two claims resting on the same evidence get
+two entries in `sources` (marker_errors).
 
 Invalid answers go back to the model to fix.
 """
@@ -35,7 +37,9 @@ SOURCES_SCHEMA = {
     "description": ("One entry per factual claim and the evidence behind it. A claim backed by "
                     "two chunks or queries gets two entries. Use [] only if the answer makes no factual claims. "
                     "In your answer text, put [n] right after each claim, where n is the 1-based position "
-                    "of its entry here (e.g. [1], or [1][2] for two sources). Every entry must be referenced."),
+                    "of its entry here (e.g. [1], or [1][2] for a claim with two sources). Each [n] must appear "
+                    "EXACTLY ONCE: if two claims rest on the same chunk or query, add a separate entry for each "
+                    "claim (repeat the document/table reference) with its own claim text."),
     "items": {
         "anyOf": [
             {
@@ -91,7 +95,10 @@ def make_submit_tool(schema: dict) -> Tool:
                      "claim: chunks you got from search_documents (chunk_id, document_name, page_number) "
                      "and/or the exact SQL you ran with query_database (table, sql). In the answer text, "
                      "mark each claim inline with [n] = its 1-based position in `sources`, right after the "
-                     "claim, e.g. \"Oslo met the target [1].\" Every source must be marked at least once."),
+                     "claim, e.g. \"Oslo met the target [1], Bergen missed it [2].\" Every source must be marked, "
+                     "and each marker exactly once: one marker per claim. If two claims rest on the same evidence, "
+                     "give each claim its own entry in `sources` (repeating the reference), so each claim can be "
+                     "reviewed separately."),
         input_schema=schema,
     )
 
@@ -181,11 +188,18 @@ def answer_text(answer) -> str:
 
 
 def marker_errors(answer: dict) -> list[str]:
-    """Every [n] must point to a source, and every source must be referenced."""
+    """Every [n] must point to a source, every source must be referenced, each [n] exactly once."""
     n_sources = len(answer.get("sources", []))
-    used = {int(m) for m in MARKER.findall(answer_text(answer))}
+    found = [int(m) for m in MARKER.findall(answer_text(answer))]
+    used = set(found)
     errors = [f"marker [{m}] has no matching source (there are {n_sources} sources; markers are 1-based)"
               for m in sorted(used) if not 1 <= m <= n_sources]
+    repeated = sorted(m for m in used if found.count(m) > 1)
+    if repeated:
+        errors.append(f"markers {', '.join(f'[{m}]' for m in repeated)} are used more than once. Each marker must "
+                      "appear exactly once (one marker = one claim). For each extra claim, add a new entry to "
+                      "sources with its own claim text (repeating the same document/table reference) and use "
+                      "its new number")
     missing = [i for i in range(1, n_sources + 1) if i not in used]
     if missing:
         errors.append(f"sources {', '.join(f'[{i}]' for i in missing)} are never referenced in the answer text; "

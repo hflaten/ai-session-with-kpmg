@@ -40,7 +40,7 @@ Placeholders used below — replace them in the Lovable project, never commit re
 | GET | `/agent/stream` | `?task=&mode=&api_key=` | SSE stream for `EventSource` (no `output_schema`) |
 | GET | `/runs/{run_id}` | – | the stored run: `{id, task, status, answer, trace, agent_name, parent_run_id, …}` |
 | GET | `/runs/{run_id}/sources` | – | the answer's sources **resolved**: page text / table rows, `marker`, latest `review`, plus a review `summary` (sections 5 and 8) |
-| POST | `/runs/{run_id}/sources/{index}/review` | `{decision: "accepted" \| "rejected", reviewer?, comment?}` | `{run_id, index, marker, review}` (section 8) |
+| POST | `/runs/{run_id}/claims/{marker}/review` | `{decision: "accepted" \| "rejected", reviewer?, comment?}` | `{run_id, marker, review}` — `marker` is the `[n]` in the text (section 8) |
 | GET | `/runs/{run_id}/tree` | – | delegation tree `{id, agent_name, task, status, duration_ms, children: [...]}` |
 | GET | `/approvals` | – | `{pending: [{run_id, tool, input, waiting_seconds}]}` |
 | POST | `/runs/{run_id}/approve` | `{reason?: string}` | `{run_id, decision: "approved"}` |
@@ -142,12 +142,15 @@ With an `output_schema`, `answer` looks like this (your fields + `sources`):
 
 ```json
 {
-  "answer": "The target was at least 45% for every office [1]. Only Oslo met it, at 46.3% [2]. Bergen missed it at 41.8% after hiring four junior auditors [2][3].",
+  "answer": "The target was at least 45% for every office [1], and offices below it must present a recovery plan in May [2]. Only Oslo met it, at 46.3% [3].",
   "sources": [
     {"claim": "The target is at least 45% gross margin for every office",
      "document_name": "nordvik_q1_2026_report.pdf", "page_number": 1,
      "chunk_id": "nordvik_q1_2026_report.pdf:p1:c0"},
-    {"claim": "Actual Q1 2026 margins by office",
+    {"claim": "Offices below target must present a recovery plan in May 2026",
+     "document_name": "nordvik_q1_2026_report.pdf", "page_number": 1,
+     "chunk_id": "nordvik_q1_2026_report.pdf:p1:c0"},
+    {"claim": "Oslo's actual Q1 2026 margin was 46.3%",
      "table": "sample_sales",
      "sql": "select region, round(100*(sum(revenue)-sum(cost))/sum(revenue),2) as margin from sample_sales ..."}
   ]
@@ -162,16 +165,58 @@ Two kinds of source — tell them apart by which key exists:
 The backend has already checked that every cited chunk was really found by a search in this
 run (same document and page), and every SQL really ran. One claim can have several entries.
 
-### Inline markers `[n]`
+### Inline markers `[n]` — one marker = one claim
 
 The answer text cites inline: **`[n]` right after a claim, where `n` is the 1-based position in
-`sources`** — `[1]` is `sources[0]`, `[2]` is `sources[1]`. A claim with two sources gets `[1][2]`.
-The backend guarantees: every marker points to an existing source, and every source is marked at
-least once (otherwise the model is made to fix its answer). Markers can appear in any text field
-of your schema, not only `answer`.
+`sources`** — `[1]` is `sources[0]`, `[2]` is `sources[1]`. The backend guarantees:
 
-To render: split the text on `/\[(\d+)\]/`, turn each number into a clickable superscript, and
-make the sentence (or clause) just before it clickable too.
+- every marker points to an existing source, and every source is marked;
+- **each marker appears exactly once** — one marker is one claim, so each claim can be reviewed on
+  its own. Two claims resting on the same evidence get **two entries** in `sources` (same
+  document/page/chunk or table/SQL, different `claim`), as in the example above (`[1]` and `[2]`);
+- a claim backed by two sources gets two adjacent markers, `[1][2]` — still one claim.
+
+Markers can appear in any text field of your schema, not only `answer`.
+
+**Rendering claim spans.** Highlight each claim's own text, not the whole sentence, so a sentence
+with two claims can show one green and one red. A claim's span runs from the end of the previous
+marker (or the start of the sentence / line, whichever is later) up to its marker. This function
+does the split (tested against real answers; joining the parts gives back the original text):
+
+```js
+// Split answer text into plain text and claim spans.
+// A claim span runs from the end of the previous marker (or the start of the
+// sentence / line, whichever is later) up to its marker(s). "[1][2]" = one claim, two sources.
+function splitClaims(text) {
+  const parts = [];                                   // {type: "text"|"claim", text, markers?}
+  const group = /(?:\[\d+\])+/g;                      // one or more adjacent markers
+  let last = 0, m;
+  while ((m = group.exec(text))) {
+    const before = text.slice(last, m.index);
+    // the claim starts after the last sentence end or line break in `before`
+    let start = 0;
+    for (const b of before.matchAll(/[.!?](?=\s)\s*|\n/g)) start = b.index + b[0].length;
+    // keep joiners, list bullets and spaces outside the highlight
+    const lead = before.slice(start).match(/^[\s,;:]*(?:(?:and|but|while)\s+)?(?:[-*•]\s+|\d+\.\s+)?/i)[0];
+    const claimStart = start + lead.length;
+    if (claimStart > 0) parts.push({ type: "text", text: before.slice(0, claimStart) });
+    const markers = m[0].match(/\d+/g).map(Number);
+    parts.push({ type: "claim", text: before.slice(claimStart), markers });   // keeps the space before the marker
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push({ type: "text", text: text.slice(last) });
+  return parts;
+}
+```
+
+Example — `splitClaims("The target is 45% [1], and plans are due in May [2].")` returns:
+
+```json
+[{"type": "claim", "text": "The target is 45% ", "markers": [1]},
+ {"type": "text",  "text": ", and "},
+ {"type": "claim", "text": "plans are due in May ", "markers": [2]},
+ {"type": "text",  "text": "."}]
+```
 
 ## 5. Clickable sources: `GET /runs/{run_id}/sources`
 
@@ -186,8 +231,11 @@ the inline `marker` (`index + 1`) and the latest human `review` (section 8):
     {"index": 0, "marker": 1, "kind": "document", "claim": "...", "document_name": "nordvik_q1_2026_report.pdf",
      "page_number": 1, "chunk_id": "nordvik_q1_2026_report.pdf:p1:c0",
      "text": "Nordvik Advisory - Q1 2026 Management Report ...", "error": null,
-     "review": {"decision": "accepted", "reviewer": "Ana", "comment": "matches page 1",
-                "created_at": "2026-11-05T15:02:11Z", "id": "...", "source_index": 0}},
+     "review": {"marker": 1, "decision": "accepted", "reviewer": "Ana", "comment": "matches page 1",
+                "created_at": "2026-11-05T15:02:11Z", "id": "...",
+                "claim": "The target is at least 45% gross margin for every office", "source_kind": "document",
+                "document_name": "nordvik_q1_2026_report.pdf", "page_number": 1,
+                "chunk_id": "nordvik_q1_2026_report.pdf:p1:c0", "table_name": null, "sql_query": null}},
     {"index": 1, "marker": 2, "kind": "database", "claim": "...", "table": "sample_sales", "sql": "select ...",
      "columns": ["region", "revenue", "cost", "margin_pct"],
      "rows": [{"region": "Bergen", "revenue": 710000.0, "cost": 413000.0, "margin_pct": 41.83}],
@@ -242,28 +290,30 @@ const res = await fetch(`${BACKEND_URL}/upload/table`, {  // or /upload/pdf for 
 - PDF upload → `{document_name, pages, chunks}`. Takes a few seconds (embeddings).
 - Uploaded data is available to the agent in the very next question.
 
-## 8. Per-claim review: accept / reject a source
+## 8. Per-claim review: accept / reject a claim
 
-A reviewer can accept or reject each cited source of a finished answer.
+A reviewer accepts or rejects each **claim** — each `[n]` in the answer — on its own.
 
 ```ts
-await fetch(`${BACKEND_URL}/runs/${runId}/sources/${index}/review`, {
+await fetch(`${BACKEND_URL}/runs/${runId}/claims/${marker}/review`, {   // marker = the n in [n]
   method: "POST",
   headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
   body: JSON.stringify({ decision: "accepted", reviewer: "Ana", comment: "matches page 1" }),
 });
-// -> { run_id, index, marker, review: { id, created_at, source_index, decision, reviewer, comment } }
+// -> { run_id, marker, review: { id, created_at, marker, decision, reviewer, comment,
+//      claim, source_kind, document_name, page_number, chunk_id, table_name, sql_query } }
 ```
 
-> **Numbering:** `{index}` in the URL is **0-based** — the `index` field from `/sources`.
-> The marker in the text is **1-based**: marker `[3]` → the source with `marker: 3` → its `index` is 2.
-
+- **One numbering:** the URL takes the marker number, 1-based, exactly as written in the text.
+  `[3]` → `/claims/3/review`. (`index` in `/sources` is only the 0-based list position.)
 - `decision`: `"accepted"` or `"rejected"`; `reviewer` and `comment` are optional.
-- Reviewing again adds a new review; the newest one is the current decision (`/sources` returns it
-  as `review`). History is kept in the database.
-- `GET /runs/{run_id}/sources` → `summary: {total, accepted, rejected, unreviewed}` for a progress
-  bar: "{accepted} of {total} claims verified".
-- 404 = unknown run, or index out of range. 422 = `decision` missing or not one of the two values.
+- Each review stores a **snapshot** of the claim text and its reference (document + page + chunk,
+  or table + SQL), so the audit record stands on its own even if the run changes later.
+- Reviewing again adds a new review; the newest is the current decision (`/sources` returns it as
+  `review`). History is kept in the database.
+- `GET /runs/{run_id}/sources` → `summary: {total, accepted, rejected, unreviewed}`; `total` is the
+  number of claims. Progress bar: "{accepted} of {total} claims verified".
+- 404 = unknown run, or marker out of range (markers start at 1). 422 = bad `decision`.
 
 ---
 
@@ -353,8 +403,9 @@ STREAM EVENTS
 
 CLICKABLE SOURCES
 - data.answer.answer contains inline markers [1], [2]... right after each claim; [n] is the
-  1-based position in data.answer.sources. Render each marker as a clickable superscript that
-  opens that source's side sheet (below).
+  1-based position in data.answer.sources, and each marker appears exactly once (one marker =
+  one claim; "[1][2]" = one claim with two sources). Render each marker as a clickable
+  superscript that opens that source's side sheet (below).
 - data.answer.sources is a list. Each item is EITHER a document source
   { claim, document_name, page_number, chunk_id } OR a database source { claim, table, sql }.
 - After "done", call GET {BACKEND_URL}/runs/{run_id}/sources. It returns
@@ -400,35 +451,65 @@ For an app already built from the prompt above. Paste as a follow-up message in 
 ````text
 Add inline citations and per-claim review to the assistant answers. Use only the API below.
 
-1. INLINE MARKERS
+1. CLAIM SPANS AND MARKERS
 - The answer text (data.answer.answer from the "done" event) contains markers like [1], [2]
-  right after each claim. [n] is 1-based: [1] = data.answer.sources[0].
-- Render the answer as Markdown, but split it on the regex /\[(\d+)\]/ and make each marker a
-  small superscript badge. Make the sentence or clause just before a marker clickable too
-  (subtle dotted underline). A claim can have several markers, e.g. [1][2].
-- Clicking a marker or its sentence opens the existing source side sheet for that source.
+  right after each claim. [n] is 1-based: [1] = data.answer.sources[0]. Each marker appears
+  exactly once: one marker = one claim. "[1][2]" right after one claim = one claim with two sources.
+- Split the answer text into plain text and claim spans with EXACTLY this function:
 
-2. REVIEW STATE
+// Split answer text into plain text and claim spans.
+// A claim span runs from the end of the previous marker (or the start of the
+// sentence / line, whichever is later) up to its marker(s). "[1][2]" = one claim, two sources.
+function splitClaims(text) {
+  const parts = [];                                   // {type: "text"|"claim", text, markers?}
+  const group = /(?:\[\d+\])+/g;                      // one or more adjacent markers
+  let last = 0, m;
+  while ((m = group.exec(text))) {
+    const before = text.slice(last, m.index);
+    // the claim starts after the last sentence end or line break in `before`
+    let start = 0;
+    for (const b of before.matchAll(/[.!?](?=\s)\s*|\n/g)) start = b.index + b[0].length;
+    // keep joiners, list bullets and spaces outside the highlight
+    const lead = before.slice(start).match(/^[\s,;:]*(?:(?:and|but|while)\s+)?(?:[-*•]\s+|\d+\.\s+)?/i)[0];
+    const claimStart = start + lead.length;
+    if (claimStart > 0) parts.push({ type: "text", text: before.slice(0, claimStart) });
+    const markers = m[0].match(/\d+/g).map(Number);
+    parts.push({ type: "claim", text: before.slice(claimStart), markers });   // keeps the space before the marker
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push({ type: "text", text: text.slice(last) });
+  return parts;
+}
+
+- Render the parts in order: "text" parts as normal text; "claim" parts as a clickable span
+  (subtle dotted underline) followed by one small superscript badge per number in markers.
+  Apply this to the text of each paragraph and list item (keep Markdown for headings, bold and
+  lists; use react-markdown with custom p/li renderers that call splitClaims on their text).
+- Clicking a claim span or one of its badges opens the existing source side sheet for that
+  marker's source (for "[1][2]" the badge decides which; the span opens the first).
+
+2. REVIEW STATE AND HIGHLIGHTING
 - After "done", and after every review, call GET {BACKEND_URL}/runs/{run_id}/sources (with the
   X-API-Key header). It returns { summary: {total, accepted, rejected, unreviewed}, sources: [...] }.
-  Each source has: index (0-based), marker (1-based, = index + 1), kind, claim, the evidence
-  (text for documents; columns + rows + sql for database), error, and review (null, or
-  {decision: "accepted" | "rejected", reviewer, comment, created_at}).
-- Highlight each marked sentence and its badge by its source's review:
-    accepted -> green background, rejected -> red background with strikethrough on the badge,
-    no review -> no highlight. If a sentence has several markers, red wins over green; it is
-    green only when all its sources are accepted.
+  Each source has: marker (1-based, the [n] in the text), kind, claim, the evidence (text for
+  documents; columns + rows + sql for database), error, and review (null, or
+  {decision: "accepted" | "rejected", reviewer, comment, created_at, ...}).
+- Highlight each CLAIM SPAN (not the whole sentence) by the review of its marker(s):
+    accepted -> green background, rejected -> red background, no review -> no highlight.
+  For a span with several markers: red if any is rejected, green only if all are accepted.
+  A sentence with two claims can therefore show one green and one red span.
+- Badges get the same colour as their own marker's review.
 
 3. ACCEPT / REJECT IN THE SOURCE SHEET
-- At the bottom of the source side sheet add: an optional "Comment" textarea, a "Reviewer"
-  text field (remember its value in localStorage), and two buttons "Accept" (green) and
-  "Reject" (red).
-- Clicking sends POST {BACKEND_URL}/runs/{run_id}/sources/{index}/review with headers
+- At the top of the sheet show the claim being reviewed ("Claim [3]: <claim text>").
+- At the bottom add: an optional "Comment" textarea, a "Reviewer" text field (remember its value
+  in localStorage), and two buttons "Accept" (green) and "Reject" (red).
+- Clicking sends POST {BACKEND_URL}/runs/{run_id}/claims/{marker}/review with headers
   Content-Type: application/json and X-API-Key, body
   { "decision": "accepted" or "rejected", "reviewer": <text or omit>, "comment": <text or omit> }.
-  IMPORTANT: {index} is the 0-based "index" field of that source, NOT the marker number.
+  {marker} is the marker number exactly as shown in the text ([3] -> /claims/3/review).
 - On success, show a toast "Claim [marker] accepted/rejected", then reload /sources to refresh
-  the highlights and the progress bar. If the source already has a review, show it in the sheet
+  the highlights and the progress bar. If the claim already has a review, show it in the sheet
   ("Rejected by Ana: wrong quarter") and let the user change it (a new review replaces it).
 
 4. PROGRESS BAR

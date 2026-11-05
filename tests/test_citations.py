@@ -111,7 +111,24 @@ def test_invented_citation_is_rejected_then_fixed(monkeypatch):
 # ---------- inline markers ----------
 
 def test_markers_valid():
-    a = {"answer": "Target 45% [1]. Oslo 46% [2][1].", "sources": [DOC_SOURCE, DB_SOURCE]}
+    a = {"answer": "Target 45% [1]. Oslo 46% [2].", "sources": [DOC_SOURCE, DB_SOURCE]}
+    assert marker_errors(a) == []
+
+
+def test_one_claim_may_have_two_sources():
+    a = {"answer": "Bergen missed the target [1][2].", "sources": [DOC_SOURCE, DB_SOURCE]}
+    assert marker_errors(a) == []
+
+
+def test_reused_marker_is_rejected():
+    a = {"answer": "Target 45% [1]. Recovery plans due in May [1].", "sources": [DOC_SOURCE]}
+    errors = marker_errors(a)
+    assert len(errors) == 1 and "[1] are used more than once" in errors[0] and "add a new entry" in errors[0]
+
+
+def test_same_evidence_two_claims_two_entries_is_fine():
+    second = {**DOC_SOURCE, "claim": "Recovery plans are due in May"}
+    a = {"answer": "Target 45% [1]. Recovery plans due in May [2].", "sources": [DOC_SOURCE, second]}
     assert marker_errors(a) == []
 
 
@@ -146,3 +163,16 @@ def test_missing_markers_are_sent_back_then_fixed(monkeypatch):
     r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
     assert "never referenced" in seen[2]["content"]
     assert r.answer["answer"] == "Target is 45% [1]."
+
+
+
+def test_reused_marker_is_sent_back_then_fixed(monkeypatch):
+    second = {**DOC_SOURCE, "claim": "Recovery plans are due in May"}
+    seen = scripted(monkeypatch, [
+        LLMResponse("", [ToolCall("a", "search_documents", {"query": "target"})]),
+        LLMResponse("", [ToolCall("b", "submit_answer", {"answer": "45% [1]. May [1].", "sources": [DOC_SOURCE]})]),
+        LLMResponse("", [ToolCall("c", "submit_answer", {"answer": "45% [1]. May [2].", "sources": [DOC_SOURCE, second]})]),
+    ])
+    r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
+    assert "used more than once" in seen[2]["content"]
+    assert [s["claim"] for s in r.answer["sources"]] == [DOC_SOURCE["claim"], "Recovery plans are due in May"]

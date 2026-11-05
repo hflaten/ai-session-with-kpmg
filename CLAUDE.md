@@ -35,8 +35,9 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 - `sample_sales`: 24 rows of made-up demo data for testing query_database (drop before real use).
 - `saved_reports`: id, created_at, run_id, title, content. Written only by `save_report` after a human
   approves. RLS on, with a read policy for `agent_readonly`. Kept by the reset script.
-- `claim_reviews`: id, created_at, run_id (cascade), source_index (0-based), decision (accepted | rejected),
-  reviewer, comment. Newest row per (run_id, source_index) is the current decision. Backend only; emptied by the reset script.
+- `claim_reviews`: id, created_at, run_id (cascade), source_index (0-based) + generated `marker` (1-based), decision
+  (accepted | rejected), reviewer, comment, plus a **snapshot** of the claim: claim, source_kind, document_name,
+  page_number, chunk_id, table_name, sql_query. Newest row per claim is the current decision. Backend only; emptied by the reset script.
 - `document_chunks`: chunk_id (`file:p<page>:c<index>`), document_name, page_number, chunk_index,
   text, embedding `vector(1536)` with an HNSW cosine index. Not readable by `agent_readonly`;
   `search_documents` reads it with a fixed query. Re-uploading a file name replaces its chunks.
@@ -74,8 +75,9 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 ```
 
 **Inline markers** (`marker_errors`): the answer text must cite with `[n]` right after each claim, `n` = 1-based
-position in `sources`. Every marker must map to a source and every source must be marked at least once;
-markers are read from all text fields except `sources`. Failures go back to the model.
+position in `sources`. Every marker must map to a source, every source must be marked, and **each marker
+appears exactly once** (one marker = one claim; two claims on the same evidence = two `sources` entries;
+`[1][2]` = one claim, two sources). Markers are read from all text fields except `sources`. Failures go back to the model.
 
 **Citation checks** (`citation_errors` in `app/agent/structured.py`): a `chunk_id` must have been
 returned by `search_documents` in this run with the same document and page; a `sql` must match
@@ -121,7 +123,7 @@ comments show up immediately. The list of uploaded documents (`describe_document
 | GET | `/approvals` | – | `{pending: [{run_id, tool, input, waiting_seconds}]}` |
 | POST | `/runs/{run_id}/approve` | `{reason?}` | `{run_id, decision: "approved"}`; 404 if the run isn't waiting |
 | POST | `/runs/{run_id}/reject` | `{reason?}` | `{run_id, decision: "rejected"}`; 404 if the run isn't waiting |
-| POST | `/runs/{run_id}/sources/{index}/review` | `{decision: accepted \| rejected, reviewer?, comment?}` | `{run_id, index, marker, review}`; index is 0-based (`marker` = index + 1); 404 bad run/index |
+| POST | `/runs/{run_id}/claims/{marker}/review` | `{decision: accepted \| rejected, reviewer?, comment?}` | `{run_id, marker, review}`; marker = the `[n]` in the text (1-based); 404 bad run/marker |
 | POST | `/upload/table` | multipart: `file` (.csv/.xlsx), `column_descriptions?` (JSON string) | `{tables: [{table, rows, comment, columns}], unused_column_descriptions}` |
 | POST | `/upload/pdf` | multipart: `file` (.pdf, max 20 MB) | `{document_name, pages, chunks}` |
 

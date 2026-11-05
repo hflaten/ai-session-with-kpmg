@@ -59,8 +59,8 @@ def test_sources_carry_marker_review_and_summary(monkeypatch):
     monkeypatch.setattr(sources.runs, "get_run", lambda run_id: {"id": run_id, "answer": ANSWER})
     monkeypatch.setattr(sources, "_chunk_text", lambda cid: "text")
     monkeypatch.setattr(sources, "query_database", lambda sql: {"columns": [], "rows": [], "row_count": 0, "truncated": False})
-    monkeypatch.setattr(sources.reviews, "latest_reviews",
-                        lambda run_id: {1: {"decision": "rejected", "reviewer": "Ana", "comment": "wrong quarter"}})
+    monkeypatch.setattr(sources.reviews, "latest_reviews",          # keyed by marker (1-based)
+                        lambda run_id: {2: {"marker": 2, "decision": "rejected", "reviewer": "Ana", "comment": "wrong quarter"}})
     body = client.get(f"/runs/{RUN}/sources").json()
     assert [(s["index"], s["marker"]) for s in body["sources"]] == [(0, 1), (1, 2)]
     assert body["sources"][0]["review"] is None
@@ -71,28 +71,31 @@ def test_sources_carry_marker_review_and_summary(monkeypatch):
 @pytest.fixture
 def review_api(monkeypatch):
     saved = []
-    monkeypatch.setattr(sources, "source_count", lambda run_id: 2 if run_id == RUN else None)
+    monkeypatch.setattr(sources, "answer_sources", lambda run_id: ANSWER["sources"] if run_id == RUN else None)
     from app.routes import agent as agent_routes
     monkeypatch.setattr(agent_routes.reviews, "add_review",
-                        lambda run_id, i, decision, reviewer, comment: saved.append((i, decision, reviewer, comment))
-                        or {"source_index": i, "decision": decision, "reviewer": reviewer, "comment": comment})
+                        lambda run_id, marker, source, decision, reviewer, comment:
+                        saved.append((marker, source["claim"], decision, reviewer, comment))
+                        or {"marker": marker, "decision": decision, "claim": source["claim"]})
     return saved
 
 
-def test_review_a_source(review_api):
-    r = client.post(f"/runs/{RUN}/sources/1/review", json={"decision": "accepted", "reviewer": "Ana", "comment": "checked p.2"})
-    assert r.status_code == 200
-    assert r.json()["marker"] == 2 and r.json()["review"]["decision"] == "accepted"
-    assert review_api == [(1, "accepted", "Ana", "checked p.2")]
-    assert client.post(f"/runs/{RUN}/sources/0/review", json={"decision": "rejected"}).status_code == 200  # optional fields
+def test_review_a_claim_by_its_marker(review_api):
+    r = client.post(f"/runs/{RUN}/claims/2/review", json={"decision": "accepted", "reviewer": "Ana", "comment": "checked"})
+    assert r.status_code == 200 and r.json()["marker"] == 2
+    # marker 2 = sources[1]: the snapshot is that claim
+    assert review_api == [(2, "Oslo 46%", "accepted", "Ana", "checked")]
+    assert client.post(f"/runs/{RUN}/claims/1/review", json={"decision": "rejected"}).status_code == 200  # optional fields
+    assert review_api[1][:2] == (1, "Target 45%")
 
 
 @pytest.mark.parametrize("path, body, status", [
-    (f"/runs/{RUN}/sources/2/review", {"decision": "accepted"}, 404),        # only indexes 0 and 1
-    (f"/runs/{RUN}/sources/-1/review", {"decision": "accepted"}, 404),
-    ("/runs/44444444-4444-4444-4444-444444444444/sources/0/review", {"decision": "accepted"}, 404),  # no such run
-    (f"/runs/{RUN}/sources/0/review", {"decision": "maybe"}, 422),           # only accepted / rejected
-    (f"/runs/{RUN}/sources/0/review", {}, 422),
+    (f"/runs/{RUN}/claims/0/review", {"decision": "accepted"}, 404),        # markers start at 1
+    (f"/runs/{RUN}/claims/3/review", {"decision": "accepted"}, 404),        # only [1] and [2]
+    ("/runs/44444444-4444-4444-4444-444444444444/claims/1/review", {"decision": "accepted"}, 404),
+    (f"/runs/{RUN}/claims/1/review", {"decision": "maybe"}, 422),
+    (f"/runs/{RUN}/claims/1/review", {}, 422),
+    (f"/runs/{RUN}/sources/0/review", {"decision": "accepted"}, 404),       # old 0-based URL is gone
 ])
 def test_bad_reviews_are_refused(review_api, path, body, status):
     assert client.post(path, json=body).status_code == status

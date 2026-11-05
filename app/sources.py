@@ -32,7 +32,7 @@ def resolve_sources(run_id: str) -> list[dict] | None:
     latest = reviews.latest_reviews(run_id)
     resolved = []
     for i, s in enumerate(answer.get("sources", [])):
-        base = {"index": i, "marker": i + 1, "review": latest.get(i)}
+        base = {"index": i, "marker": i + 1, "review": latest.get(i + 1)}
         if "chunk_id" in s:
             text = _chunk_text(s["chunk_id"])
             resolved.append({**base, "kind": "document", **s, "text": text,
@@ -54,10 +54,10 @@ def review_summary(resolved: list[dict]) -> dict:
             "rejected": decisions.count("rejected"), "unreviewed": decisions.count(None)}
 
 
-def source_count(run_id: str) -> int | None:
-    """Number of sources in a run's structured answer; None if the run doesn't exist."""
+def answer_sources(run_id: str) -> list[dict] | None:
+    """The sources list of a run's structured answer ([] for text answers); None if no such run."""
     run = runs.get_run(run_id)
     if run is None:
         return None
     answer = run.get("answer")
-    return len(answer.get("sources", [])) if isinstance(answer, dict) else 0
+    return answer.get("sources", []) if isinstance(answer, dict) else []

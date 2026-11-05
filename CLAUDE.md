@@ -92,6 +92,6 @@ the first request after a sleep takes ~30–60 s, and any run waiting for approv
 
 - [x] 0a Repo (private, pushed)  - [x] 0b Supabase project, link, init migration
 - [x] 1 FastAPI skeleton         - [x] 2 LLM adapters (OpenAI live check pending credits)  - [x] 3 Agent loop
-- [x] 4 query_database           - [ ] 5 Structured output - [ ] 6 SSE + run logging
+- [x] 4 query_database           - [x] 5 Structured output - [ ] 6 SSE + run logging
 - [ ] 7 Uploads + RAG (approval checkpoint first) - [ ] 8 Human-in-the-loop
 - [ ] 9 Orchestrator             - [ ] 10 Deploy

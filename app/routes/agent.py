@@ -1,7 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.agent import run_agent
+from app.agent.structured import check_output_schema
 from app.llm import Tool
 from app.tools.database import query_database_tool
 
@@ -19,10 +20,17 @@ TOOLS: list[Tool] = [query_database_tool]
 class RunRequest(BaseModel):
     task: str
     system_prompt: str | None = None
+    output_schema: dict | None = None   # JSON schema for a structured answer
 
 
 @router.post("/run")
 def run(req: RunRequest):
     """Run the agent to completion and return the answer plus the full trace."""
-    result = run_agent(req.system_prompt or DEFAULT_SYSTEM_PROMPT, TOOLS, req.task)
+    if req.output_schema:
+        try:
+            check_output_schema(req.output_schema)
+        except Exception as e:
+            raise HTTPException(400, f"Invalid output_schema: {e}")
+    result = run_agent(req.system_prompt or DEFAULT_SYSTEM_PROMPT, TOOLS, req.task,
+                       output_schema=req.output_schema)
     return {"answer": result.answer, "stopped_reason": result.stopped_reason, "trace": result.trace}

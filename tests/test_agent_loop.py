@@ -15,7 +15,7 @@ def scripted_llm(monkeypatch, responses):
     """Replace call_llm with one that returns `responses` in order and records what it was sent."""
     seen = []
 
-    def fake(system, messages, tools):
+    def fake(system, messages, tools, force_tool=None):
         seen.append([dict(m) for m in messages])
         return responses[len(seen) - 1]
 

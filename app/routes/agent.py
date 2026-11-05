@@ -4,6 +4,7 @@ POST /agent/run               run to completion, return answer + trace
 POST /agent/stream            same, but stream each step live (Server-Sent Events)
 GET  /agent/stream            same, with ?task=... (for the browser's EventSource, which only does GET)
 GET  /runs/{id}               a logged run from agent_runs
+GET  /runs/{id}/tree          the run and the specialist runs it delegated to, nested
 GET  /approvals               runs currently waiting for a human decision
 POST /runs/{id}/approve       let the waiting action run      body: {"reason": "..."} (optional)
 POST /runs/{id}/reject        don't run it                     body: {"reason": "..."} (optional)
@@ -77,8 +78,10 @@ def stream_post(req: RunRequest):
 
 
 @router.get("/agent/stream")
-def stream_get(task: str, system_prompt: str | None = None):
-    return _stream(RunRequest(task=task, system_prompt=system_prompt))
+def stream_get(task: str, system_prompt: str | None = None, mode: str = "agent"):
+    if mode not in ("agent", "orchestrator"):
+        raise HTTPException(400, "mode must be 'agent' or 'orchestrator'")
+    return _stream(RunRequest(task=task, system_prompt=system_prompt, mode=mode))
 
 
 @router.get("/runs/{run_id}")
@@ -87,6 +90,14 @@ def get_run(run_id: UUID):
     if row is None:
         raise HTTPException(404, "Run not found")
     return row
+
+
+@router.get("/runs/{run_id}/tree")
+def get_tree(run_id: UUID):
+    tree = runs.get_tree(str(run_id))
+    if tree is None:
+        raise HTTPException(404, "Run not found")
+    return tree
 
 
 # ---------- human-in-the-loop ----------

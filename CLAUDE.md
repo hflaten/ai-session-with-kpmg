@@ -26,7 +26,7 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 | Streaming | `app/routes/` | SSE, one event per agent step. Every run logged to `agent_runs`. |
 | Ingest | `app/ingest/` | CSV/Excel → own table via pandas, with table + column comments; PDF → per-page chunks → embeddings → `document_chunks`. |
 | Human-in-the-loop | `app/agent/approvals.py` | Tools flagged `requires_approval` (only `save_report`) pause the run until `/runs/{id}/approve` or `/reject` (10 min timeout = rejected). The request is registered *before* it is announced, so an instant click is never lost. Held in memory → single worker. |
-| Orchestrator | `app/agent/orchestrator.py` | Orchestrator's tools call `run_agent` for two specialists. Trace nests specialist traces; `agent_runs.parent_run_id` links them. |
+| Orchestrator | `app/agent/orchestrator.py` | `mode: "orchestrator"`. No direct data access: its tools `ask_data_analyst` / `ask_document_researcher` each run `run_agent` for a specialist (own prompt, own tool, only its own context). The delegation entry nests the specialist's trace (`child_trace`); `agent_runs.parent_run_id` links the runs; `GET /runs/{id}/tree` rebuilds the tree. Specialists return `chunks_found` + `sql_run`, so the orchestrator's citations are checked too. |
 
 ### Database (supabase/migrations)
 
@@ -104,10 +104,11 @@ comments show up immediately. The list of uploaded documents (`describe_document
 | Method | Path | Body / params | Returns |
 |---|---|---|---|
 | GET | `/health` | – | `{status, llm_provider, llm_model, database}` |
-| POST | `/agent/run` | `{task, system_prompt?, output_schema?}` | `{run_id, answer, stopped_reason, trace}` |
+| POST | `/agent/run` | `{task, system_prompt?, output_schema?, mode?: "agent" \| "orchestrator"}` | `{run_id, answer, stopped_reason, trace}` |
 | POST | `/agent/stream` | same JSON body | SSE stream (below) — read with `fetch` + `response.body.getReader()` |
-| GET | `/agent/stream` | `?task=...&system_prompt=...` | SSE stream — works with `new EventSource(url)` (no output_schema) |
+| GET | `/agent/stream` | `?task=...&system_prompt=...&mode=...` | SSE stream — works with `new EventSource(url)` (no output_schema) |
 | GET | `/runs/{run_id}` | – | the logged row from `agent_runs` |
+| GET | `/runs/{run_id}/tree` | – | `{id, agent_name, task, status, duration_ms, children: [...]}` |
 | GET | `/approvals` | – | `{pending: [{run_id, tool, input, waiting_seconds}]}` |
 | POST | `/runs/{run_id}/approve` | `{reason?}` | `{run_id, decision: "approved"}`; 404 if the run isn't waiting |
 | POST | `/runs/{run_id}/reject` | `{reason?}` | `{run_id, decision: "rejected"}`; 404 if the run isn't waiting |
@@ -119,6 +120,11 @@ SSE events, in order: `run_started` `{run_id}` → one `step` per trace entry
 or `error` `{error}` if the run crashed. When a flagged tool is called, an `approval_required`
 event `{run_id, tool, input}` arrives and the stream pauses until `/runs/{run_id}/approve` or `/reject`;
 then a `step` with `type: "approval"` `{decision, reason, waited_ms}` follows.
+
+Every step has an `agent` field: `agent`, `orchestrator`, `data_analyst` or `document_researcher`.
+In orchestrator mode, a `step` with `type: "delegation_started"` `{specialist, child_run_id, question}`
+is followed by that specialist's own steps (with `agent` and `run_id` of the child run), then the
+orchestrator's `tool` entry for the delegation (with `child_trace`).
 
 `answer` is a string, or an object matching `output_schema` when one is given
 (it must have `"type": "object"` at the top level and must not define `sources` itself —
@@ -212,4 +218,4 @@ the first request after a sleep takes ~30–60 s, and any run waiting for approv
 - [x] 1 FastAPI skeleton         - [x] 2 LLM adapters  - [x] 3 Agent loop
 - [x] 4 query_database           - [x] 5 Structured output - [x] 6 SSE + run logging
 - [x] 7 Uploads + RAG - [x] 8 Human-in-the-loop
-- [ ] 9 Orchestrator             - [x] 10 Deploy
+- [x] 9 Orchestrator             - [x] 10 Deploy

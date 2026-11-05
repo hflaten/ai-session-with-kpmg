@@ -61,3 +61,19 @@ def test_system_prompt_survives_db_failure(monkeypatch):
     monkeypatch.setattr(service, "describe_schema", boom)
     monkeypatch.setattr(service, "describe_documents", boom)
     assert service.build_system_prompt("Be brief.") == "Be brief."
+
+
+def test_run_tree_nests_children():
+    """Live: a parent run with two children comes back nested from runs.get_tree."""
+    from app import db, runs
+    parent = runs.create_run("tree test", agent_name="orchestrator")
+    try:
+        a = runs.create_run("child a", agent_name="data_analyst", parent_run_id=parent)
+        b = runs.create_run("child b", agent_name="document_researcher", parent_run_id=parent)
+        tree = runs.get_tree(parent)
+        assert tree["agent_name"] == "orchestrator"
+        assert [c["id"] for c in tree["children"]] == [a, b]
+        assert runs.get_tree(a)["children"] == []
+    finally:
+        with db.connect() as conn:  # children are deleted by the foreign key cascade
+            conn.execute("delete from agent_runs where id = %s", (parent,))

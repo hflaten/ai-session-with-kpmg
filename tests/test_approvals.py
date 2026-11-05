@@ -101,7 +101,7 @@ def fake_service(monkeypatch):
     monkeypatch.setattr(service.runs, "update_status", lambda run_id, status, trace=None: statuses.append(status))
     monkeypatch.setattr(service.runs, "finish_run", lambda *a, **kw: None)
     monkeypatch.setattr(service, "build_system_prompt", lambda custom: "sys")
-    monkeypatch.setattr(service, "tools_for_run", lambda run_id: [FLAGGED])
+    monkeypatch.setattr(service, "tools_for_run", lambda run_id, *a: [FLAGGED])
     return statuses
 
 

@@ -178,8 +178,9 @@ backend, printing a timeline. Note: `approve` saves a real row in `saved_reports
 
 ```bash
 .venv/bin/python -m scripts.reset_data          # dry run: lists what would be deleted
-.venv/bin/python -m scripts.reset_data --yes    # drops all uploaded/demo tables (incl. sample_sales)
-                                                # and empties document_chunks; keeps agent_runs + schema
+.venv/bin/python -m scripts.reset_data --yes    # drops all uploaded/demo tables (incl. sample_sales),
+                                                # empties document_chunks + saved_reports; keeps agent_runs
+.venv/bin/python -m scripts.reset_data --include-runs --yes   # same, and also empties agent_runs
 ```
 
 Cannot be undone, and `supabase db push` will not recreate `sample_sales` (its migration stays applied).

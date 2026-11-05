@@ -2,7 +2,7 @@
 import pytest
 
 from app.agent import loop
-from app.agent.structured import Evidence, check_output_schema, citation_errors, with_sources
+from app.agent.structured import Evidence, answer_text, check_output_schema, citation_errors, marker_errors, with_sources
 from app.llm import LLMResponse, Tool, ToolCall
 
 CHUNK = {"chunk_id": "report.pdf:p2:c1", "document_name": "report.pdf", "page_number": 2, "text": "Target 45%"}
@@ -87,7 +87,7 @@ def test_search_trace_has_chunk_ids_and_good_citations_pass(monkeypatch):
     scripted(monkeypatch, [
         LLMResponse("", [ToolCall("a", "search_documents", {"query": "target"}),
                          ToolCall("b", "query_database", {"sql": SQL})]),
-        LLMResponse("", [ToolCall("c", "submit_answer", {"answer": "ok", "sources": [DOC_SOURCE, DB_SOURCE]})]),
+        LLMResponse("", [ToolCall("c", "submit_answer", {"answer": "Target is 45% [1] and Oslo exists [2].", "sources": [DOC_SOURCE, DB_SOURCE]})]),
     ])
     r = loop.run_agent("sys", [FAKE_SEARCH, FAKE_SQL], "q", output_schema=SCHEMA)
     search_entry = next(e for e in r.trace if e.get("tool") == "search_documents")
@@ -99,9 +99,50 @@ def test_invented_citation_is_rejected_then_fixed(monkeypatch):
     invented = {**DOC_SOURCE, "chunk_id": "report.pdf:p7:c4"}
     seen = scripted(monkeypatch, [
         LLMResponse("", [ToolCall("a", "search_documents", {"query": "target"})]),
-        LLMResponse("", [ToolCall("b", "submit_answer", {"answer": "x", "sources": [invented]})]),
-        LLMResponse("", [ToolCall("c", "submit_answer", {"answer": "x", "sources": [DOC_SOURCE]})]),
+        LLMResponse("", [ToolCall("b", "submit_answer", {"answer": "x [1]", "sources": [invented]})]),
+        LLMResponse("", [ToolCall("c", "submit_answer", {"answer": "x [1]", "sources": [DOC_SOURCE]})]),
     ])
     r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
     assert "was not returned" in seen[2]["content"]         # model was told why
     assert [e["valid"] for e in r.trace if e["type"] == "final_answer"] == [False, True]
+
+
+
+# ---------- inline markers ----------
+
+def test_markers_valid():
+    a = {"answer": "Target 45% [1]. Oslo 46% [2][1].", "sources": [DOC_SOURCE, DB_SOURCE]}
+    assert marker_errors(a) == []
+
+
+def test_marker_without_source_and_unreferenced_source():
+    a = {"answer": "Target 45% [1]. Something [3].", "sources": [DOC_SOURCE, DB_SOURCE]}
+    errors = marker_errors(a)
+    assert any("[3] has no matching source" in e for e in errors)
+    assert any("[2] are never referenced" in e for e in errors)
+
+
+def test_zero_is_not_a_valid_marker():
+    assert "[0] has no matching source" in marker_errors({"answer": "x [0] [1]", "sources": [DOC_SOURCE]})[0]
+
+
+def test_markers_found_in_any_text_field_but_not_in_sources():
+    a = {"summary": "Short [1].", "details": [{"text": "More [2]."}],
+         "sources": [{**DOC_SOURCE, "claim": "[2] inside a claim does not count"}, DB_SOURCE]}
+    assert "[1]" in answer_text(a) and "inside a claim" not in answer_text(a)
+    assert marker_errors(a) == []
+
+
+def test_no_sources_no_markers_is_fine():
+    assert marker_errors({"answer": "Hello.", "sources": []}) == []
+
+
+def test_missing_markers_are_sent_back_then_fixed(monkeypatch):
+    seen = scripted(monkeypatch, [
+        LLMResponse("", [ToolCall("a", "search_documents", {"query": "target"})]),
+        LLMResponse("", [ToolCall("b", "submit_answer", {"answer": "Target is 45%.", "sources": [DOC_SOURCE]})]),
+        LLMResponse("", [ToolCall("c", "submit_answer", {"answer": "Target is 45% [1].", "sources": [DOC_SOURCE]})]),
+    ])
+    r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
+    assert "never referenced" in seen[2]["content"]
+    assert r.answer["answer"] == "Target is 45% [1]."

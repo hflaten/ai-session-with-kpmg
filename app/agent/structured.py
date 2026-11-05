@@ -13,7 +13,13 @@ either a document citation or a database citation:
 Citations are checked against what actually happened in this run (Evidence):
 a chunk_id must have been returned by search_documents (with matching document
 and page), and the sql must be a query_database call that succeeded, with the
-table appearing in it. Invalid answers go back to the model to fix.
+table appearing in it.
+
+The answer text must also cite inline: "Oslo met the target [1], Bergen missed it [2]."
+[n] is the 1-based position in `sources`. Every marker must point to a source and
+every source must be referenced at least once (marker_errors).
+
+Invalid answers go back to the model to fix.
 """
 import copy
 import re
@@ -27,7 +33,9 @@ SUBMIT_TOOL_NAME = "submit_answer"
 SOURCES_SCHEMA = {
     "type": "array",
     "description": ("One entry per factual claim and the evidence behind it. A claim backed by "
-                    "two chunks or queries gets two entries. Use [] only if the answer makes no factual claims."),
+                    "two chunks or queries gets two entries. Use [] only if the answer makes no factual claims. "
+                    "In your answer text, put [n] right after each claim, where n is the 1-based position "
+                    "of its entry here (e.g. [1], or [1][2] for two sources). Every entry must be referenced."),
     "items": {
         "anyOf": [
             {
@@ -81,7 +89,9 @@ def make_submit_tool(schema: dict) -> Tool:
         description=("Submit your final answer. Call this exactly once, when you are done, with arguments "
                      "that match the schema. Do not answer in plain text. In `sources`, cite every factual "
                      "claim: chunks you got from search_documents (chunk_id, document_name, page_number) "
-                     "and/or the exact SQL you ran with query_database (table, sql)."),
+                     "and/or the exact SQL you ran with query_database (table, sql). In the answer text, "
+                     "mark each claim inline with [n] = its 1-based position in `sources`, right after the "
+                     "claim, e.g. \"Oslo met the target [1].\" Every source must be marked at least once."),
         input_schema=schema,
     )
 
@@ -151,4 +161,33 @@ def citation_errors(sources: list[dict], evidence: Evidence) -> list[str]:
                               "copy the exact query you ran")
             elif not _table_in_sql(s["table"], s["sql"]):
                 errors.append(f"{where}: table '{s['table']}' does not appear in the sql")
+    return errors
+
+
+# ---------- inline markers ----------
+
+MARKER = re.compile(r"\[(\d+)\]")
+
+
+def answer_text(answer) -> str:
+    """All text in the answer except the sources list (the caller's schema decides the fields)."""
+    if isinstance(answer, str):
+        return answer
+    if isinstance(answer, dict):
+        return "\n".join(answer_text(v) for k, v in answer.items() if k != "sources")
+    if isinstance(answer, list):
+        return "\n".join(answer_text(v) for v in answer)
+    return ""
+
+
+def marker_errors(answer: dict) -> list[str]:
+    """Every [n] must point to a source, and every source must be referenced."""
+    n_sources = len(answer.get("sources", []))
+    used = {int(m) for m in MARKER.findall(answer_text(answer))}
+    errors = [f"marker [{m}] has no matching source (there are {n_sources} sources; markers are 1-based)"
+              for m in sorted(used) if not 1 <= m <= n_sources]
+    missing = [i for i in range(1, n_sources + 1) if i not in used]
+    if missing:
+        errors.append(f"sources {', '.join(f'[{i}]' for i in missing)} are never referenced in the answer text; "
+                      "put the marker right after the claim it supports")
     return errors

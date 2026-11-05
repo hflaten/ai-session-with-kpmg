@@ -48,7 +48,8 @@ def role_llm(final_sources):
             if not tool_results:
                 return LLMResponse("", [ToolCall("d1", "ask_data_analyst", {"question": "Bergen margin?"}),
                                         ToolCall("d2", "ask_document_researcher", {"question": "Target?"})])
-            return LLMResponse("", [ToolCall("s", "submit_answer", {"summary": "Bergen missed", "sources": final_sources})])
+            summary = "Target 45% [1]; Bergen missed it [2]." if len(final_sources) == 2 else "Bergen missed [1]."
+            return LLMResponse("", [ToolCall("s", "submit_answer", {"summary": summary, "sources": final_sources})])
         if names == ["query_database"]:                       # data analyst
             return LLMResponse("41.8%") if tool_results else LLMResponse("", [ToolCall("q", "query_database", {"sql": SQL})])
         return LLMResponse("45%") if tool_results else LLMResponse("", [ToolCall("q", "search_documents", {"query": "target"})])

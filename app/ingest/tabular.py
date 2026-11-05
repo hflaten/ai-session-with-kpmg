@@ -130,6 +130,8 @@ def ingest_table(filename: str, data: bytes, column_descriptions: dict[str, str]
                     comment = descriptions[key]
                 else:
                     comment = profile_column(original, df[column])
+                    if position in clean.fractions:
+                        comment += " Fraction, not percent: 0.51 = 51%."
                     dropped = clean.non_numeric.get(position)
                     if dropped:
                         comment += " Non-numeric values left empty: " + ", ".join(f'"{v}"' for v in dropped[:5])

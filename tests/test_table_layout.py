@@ -51,7 +51,8 @@ REPORT = [
 
 def test_title_rows_and_two_row_header():
     t = clean(REPORT, merges=["D5:F5"])
-    assert list(t.df.columns) == ["region", "revenue_q1", "revenue_q2", "revenue_total", "margin_pct"]
+    assert list(t.df.columns) == ["region", "revenue_q1", "revenue_q2", "revenue_total", "margin"]
+    assert t.fractions == {4}                              # 0.455, 0.41 -> stored as fractions
     assert t.original_headers == ["Region", "Revenue / Q1", "Revenue / Q2", "Revenue / Total", "Margin / %"]
     assert t.header_rows == [4, 5]                         # 0-based sheet rows 5 and 6
 
@@ -62,14 +63,14 @@ def test_rows_totals_footnotes_and_numbers():
     assert t.skipped_totals == ["Total"]
     assert t.notes == ["* Q2 Bergen not reported yet"]
     assert t.df["revenue_q2"].isna().tolist() == [False, True, False, False]           # "-" -> empty
-    assert t.df["margin_pct"].tolist()[:2] == [0.455, 0.41]                            # "45.5%" -> 0.455
+    assert t.df["margin"].tolist()[:2] == [0.455, 0.41]                                # "45.5%" -> 0.455
     assert t.non_numeric == {4: ["Varies"]}                                            # "n/a" is just empty
     assert t.df["revenue_total"].sum() == 535                                          # = the skipped totals row
 
 
 def test_works_without_merged_cells_too():
     """Some sheets don't merge the group label; it still applies to the empty cells to its right."""
-    assert list(clean(REPORT).df.columns) == ["region", "revenue_q1", "revenue_q2", "revenue_total", "margin_pct"]
+    assert list(clean(REPORT).df.columns) == ["region", "revenue_q1", "revenue_q2", "revenue_total", "margin"]
 
 
 def test_tidy_csv_is_unchanged():
@@ -109,7 +110,7 @@ def test_side_by_side_tables_with_same_columns_are_stacked():
         ["Alpha", 0.5, 10.0, None, "Beta", 0.2, 4.0],
         [None, None, None, None, "Gamma", 0.3, 6.0],
     ])
-    assert list(t.df.columns) == ["section", "name", "share_pct", "volume_total"]
+    assert list(t.df.columns) == ["section", "name", "share", "volume_total"]
     assert t.df["section"].tolist() == ["Operated", "Partner", "Partner"]
     assert t.df["name"].tolist() == ["Alpha", "Beta", "Gamma"]
     assert t.notes == ["Header unit: 1000 boed"]
@@ -118,3 +119,28 @@ def test_side_by_side_tables_with_same_columns_are_stacked():
 def test_single_column_table_keeps_its_rows():
     t = clean([["Names"], ["Oslo"], ["Bergen"]])
     assert t.df.iloc[:, 0].tolist() == ["Oslo", "Bergen"] and t.notes == []
+
+
+def test_percent_columns_above_one_keep_pct():
+    t = clean([["Region", "Margin %"], ["Oslo", 45.5], ["Bergen", 41.0]])
+    assert list(t.df.columns) == ["region", "margin_pct"] and t.fractions == set()
+
+
+def test_fraction_comment_on_upload(monkeypatch):
+    """The column comment says it's a fraction (tabular.ingest_table, DB writes faked)."""
+    from app.ingest import tabular
+    written = {}
+
+    class FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, stmt):
+            written.setdefault("stmts", []).append(stmt)
+
+    monkeypatch.setattr(tabular.db, "connect", lambda: FakeConn())
+    monkeypatch.setattr(pd.DataFrame, "to_sql", lambda self, *a, **kw: None)
+    result = tabular.ingest_table("report.xlsx", xlsx_bytes(REPORT, ["D5:F5"]))
+    margin = next(c for c in result["tables"][0]["columns"] if c["name"] == "margin")
+    assert margin["original_header"] == "Margin / %"
+    assert "Fraction, not percent: 0.51 = 51%." in margin["comment"]
+    assert 'Non-numeric values left empty: "Varies"' in margin["comment"]

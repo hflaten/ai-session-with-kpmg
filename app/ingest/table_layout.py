@@ -19,7 +19,9 @@ clean_sheet() reads the raw grid (no header assumed) and:
 6. turns several tables in one sheet into one table with a `section` column: stacked
    (a repeated header mid-sheet) or side by side (blocks separated by an empty column
    with the same sub-headers),
-7. converts mostly-numeric columns to numbers ("45.9%" -> 0.459, "-" -> empty).
+7. converts mostly-numeric columns to numbers ("45.9%" -> 0.459, "-" -> empty),
+8. names "%" columns by what they hold: 0-1 fractions get no "pct" (comment says
+   "fraction, 0.51 = 51%"); values above 1 are percentages and get "pct".
 """
 import math
 import re
@@ -40,6 +42,7 @@ class CleanTable:
     notes: list[str] = field(default_factory=list)              # footnotes + header notes
     skipped_totals: list[str] = field(default_factory=list)     # labels of skipped totals rows
     non_numeric: dict[int, list[str]] = field(default_factory=dict)  # column position -> values set to empty
+    fractions: set[int] = field(default_factory=set)            # positions of "%" columns stored as 0-1 fractions
     header_rows: list[int] = field(default_factory=list)        # 0-based rows used as header (in the sheet)
 
 
@@ -247,7 +250,7 @@ def clean_sheet(raw: pd.DataFrame) -> CleanTable:
     if has_sections and upper:                  # the first column's group label is the section title
         upper[0] = ""
     named = _combine_headers(upper, lower)
-    names = [(name or ("name" if i == 0 else f"column {i + 1}")).replace("%", "pct") for i, (name, _) in enumerate(named)]
+    names = [name or ("name" if i == 0 else f"column {i + 1}") for i, (name, _) in enumerate(named)]
     originals = [orig or name for (name, orig), name in zip(named, names)]
 
     df = pd.DataFrame(rows, columns=names) if rows else pd.DataFrame(columns=names)
@@ -265,11 +268,27 @@ def clean_sheet(raw: pd.DataFrame) -> CleanTable:
             non_numeric[i] = bad
         df.isetitem(i, pd.to_numeric(values.map(to_number), errors="coerce"))
 
+    # "%" columns: values between 0 and 1 are fractions (0.51 = 51%) -> no "pct" in the name.
+    # Values above 1 are percentages (51 = 51%) -> "pct".
+    fractions: set[int] = set()
+    for i, name in enumerate(names):
+        if "%" not in name:
+            continue
+        values = df.iloc[:, i].dropna() if first.cols[i] in first.numeric_cols else pd.Series(dtype=float)
+        if len(values) and values.between(0, 1).all():
+            fractions.add(i)
+            names[i] = re.sub(r"\s*%\s*", " ", name).strip() or f"column {i + 1}"
+        else:
+            names[i] = name.replace("%", "pct")
+    df.columns = names
+
     # 5. stacked or side-by-side tables -> section column
     if has_sections:
         df.insert(0, "section", sections, allow_duplicates=True)
         originals.insert(0, "section (title of each table in the sheet)")
         non_numeric = {i + 1: v for i, v in non_numeric.items()}   # positions shift by one
+        fractions = {i + 1 for i in fractions}
 
     return CleanTable(df=df, original_headers=originals, notes=notes, skipped_totals=totals,
-                      non_numeric=non_numeric, header_rows=[int(grid.index[p]) for p in header_pos])
+                      non_numeric=non_numeric, fractions=fractions,
+                      header_rows=[int(grid.index[p]) for p in header_pos])

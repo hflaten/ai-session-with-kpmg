@@ -37,29 +37,53 @@ def query_database(sql: str) -> dict:
 MAX_SCHEMA_TABLES = 50
 
 
-def describe_schema() -> str:
-    """List the tables the agent can read, for its system prompt.
+SCHEMA_SQL = """
+    select c.relname                                as table_name,
+           obj_description(c.oid, 'pg_class')       as table_comment,
+           a.attname                                as column_name,
+           format_type(a.atttypid, a.atttypmod)     as data_type,
+           col_description(c.oid, a.attnum)         as column_comment
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+    join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+    where n.nspname = 'public'
+      and c.relkind in ('r', 'v', 'm', 'p')          -- tables, views, materialized views
+      and has_table_privilege(c.oid, 'SELECT')       -- only what this role can read
+    order by c.relname, a.attnum
+"""
 
+
+def describe_schema() -> str:
+    """List the tables the agent can read, with table and column comments.
+
+    Called at the start of EVERY run, on purpose without caching, so newly
+    uploaded tables and edited comments show up immediately.
     Uses the read-only connection, so it shows exactly what query_database can see.
-    Saves the agent a tool call to discover the schema itself.
+
+    Output looks like:
+        - sample_sales  -- Demo data: ...
+            month date  -- First day of the month the sales belong to
+            revenue numeric(12,2)  -- Revenue in NOK, excl. VAT
     """
     with db.connect(readonly=True) as conn:
-        rows = conn.execute(
-            """select c.table_name,
-                      string_agg(c.column_name || ' ' || c.data_type, ', ' order by c.ordinal_position) as columns,
-                      obj_description(format('public.%%I', c.table_name)::regclass) as comment
-               from information_schema.columns c
-               where c.table_schema = 'public'
-               group by c.table_name
-               order by c.table_name
-               limit %s""",
-            (MAX_SCHEMA_TABLES,),
-        ).fetchall()
+        rows = conn.execute(SCHEMA_SQL).fetchall()
     if not rows:
         return "The database has no tables yet."
-    lines = [f"- {r['table_name']}({r['columns']})" + (f"  -- {r['comment']}" if r["comment"] else "")
-             for r in rows]
-    return "Tables you can query with query_database (schema 'public'):\n" + "\n".join(lines)
+
+    tables: dict[str, list[str]] = {}
+    for r in rows:
+        if r["table_name"] not in tables:
+            if len(tables) == MAX_SCHEMA_TABLES:
+                break
+            header = f"- {r['table_name']}" + (f"  -- {r['table_comment']}" if r["table_comment"] else "")
+            tables[r["table_name"]] = [header]
+        column = f"    {r['column_name']} {r['data_type']}"
+        if r["column_comment"]:
+            column += f"  -- {r['column_comment']}"
+        tables[r["table_name"]].append(column)
+
+    body = "\n".join(line for lines in tables.values() for line in lines)
+    return "Tables you can query with query_database (schema 'public'). Comments after -- explain the data:\n" + body
 
 
 query_database_tool = Tool(

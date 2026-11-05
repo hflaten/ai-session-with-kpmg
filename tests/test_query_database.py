@@ -30,11 +30,29 @@ def test_row_limit():
     assert r["row_count"] == MAX_ROWS and r["truncated"] is True
 
 
-def test_schema_lists_readable_tables_only():
+def test_schema_lists_readable_tables_with_comments():
     text = describe_schema()
-    assert "- sample_sales(id integer, month date, region text" in text
-    assert "Demo data" in text            # table comment included
+    assert "- sample_sales  -- Demo data" in text                          # table comment
+    assert "    revenue numeric(12,2)  -- Revenue in NOK, excluding VAT" in text  # column + comment
     assert "agent_runs" not in text       # not readable by the agent -> not shown
+
+
+def test_schema_is_read_fresh_each_call():
+    """No caching: a table created after the first call appears on the next one."""
+    from app import db
+    name = "zz_schema_fresh_test"
+    assert name not in describe_schema()
+    try:
+        with db.connect() as conn:
+            conn.execute(f"create table public.{name} (amount numeric)")
+            conn.execute(f"comment on table public.{name} is 'temp table'")
+            conn.execute(f"comment on column public.{name}.amount is 'amount in NOK'")
+        text = describe_schema()
+        assert f"- {name}  -- temp table" in text
+        assert "    amount numeric  -- amount in NOK" in text
+    finally:
+        with db.connect() as conn:
+            conn.execute(f"drop table if exists public.{name}")
 
 
 def test_system_prompt_survives_db_failure(monkeypatch):

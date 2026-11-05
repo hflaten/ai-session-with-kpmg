@@ -47,6 +47,8 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 - **Every search is logged in the agent trace** with the `chunk_id`s it returned.
 - **Final structured answers include a `sources` field** listing `document_name`, `page_number`
   and `chunk_id` for every claim.
+- **Uploaded tables get comments:** when loading a CSV/Excel file, add a Postgres comment on
+  the table and on **every column** describing it, so the agent sees them in its prompt.
 - **Process:** before implementing step 7, stop and show the user the table schema and the
   `sources` format for approval. After building it, run a test query and show an answer with its sources.
 
@@ -67,7 +69,10 @@ This only stops casual abuse — the token is visible in the frontend code. Rota
 (and the LLM keys) after the hackathon. If `APP_API_KEY` is unset the API returns 503 (fails closed).
 
 **Schema in the prompt:** at the start of each run, the tables the agent can read are appended
-to the system prompt (`describe_schema()` in `app/tools/database.py`), so it skips the lookup step.
+to the system prompt (`describe_schema()` in `app/tools/database.py`), including Postgres
+**table and column comments**, so it skips the lookup step and knows what columns mean.
+It is read fresh every run, deliberately **without caching**, so new uploads and edited
+comments show up immediately. Add comments with `comment on table/column ... is '...'` in a migration.
 
 | Method | Path | Body / params | Returns |
 |---|---|---|---|

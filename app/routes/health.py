@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter
 
 from app import db
@@ -14,4 +16,5 @@ def health():
         "llm_provider": settings.llm_provider,
         "llm_model": settings.llm_model or "(not set)",
         "database": "ok" if db.ping() else "unreachable",
+        "commit": os.getenv("RENDER_GIT_COMMIT", "local")[:7],  # which version is deployed (set by Render)
     }

@@ -26,7 +26,7 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 | Streaming | `app/routes/` | SSE, one event per agent step. Every run logged to `agent_runs`. |
 | Ingest | `app/ingest/` | CSV/Excel → own table via pandas, with table + column comments; PDF → per-page chunks → embeddings → `document_chunks`. |
 | Human-in-the-loop | `app/agent/approvals.py` | Tools flagged `requires_approval` (only `save_report`) pause the run until `/runs/{id}/approve` or `/reject` (10 min timeout = rejected). The request is registered *before* it is announced, so an instant click is never lost. Held in memory → single worker. |
-| Orchestrator | `app/agent/orchestrator.py` | `mode: "orchestrator"`. No direct data access: its tools `ask_data_analyst` / `ask_document_researcher` each run `run_agent` for a specialist (own prompt, own tool, only its own context). The delegation entry nests the specialist's trace (`child_trace`); `agent_runs.parent_run_id` links the runs; `GET /runs/{id}/tree` rebuilds the tree. Specialists return `chunks_found` + `sql_run`, so the orchestrator's citations are checked too. |
+| Orchestrator | `app/agent/orchestrator.py` | `mode: "orchestrator"`. Specialists run in parallel (the loop runs several plain tool calls from one response in threads, recording them in call order; trace entries have `parallel: true`). No direct data access: its tools `ask_data_analyst` / `ask_document_researcher` each run `run_agent` for a specialist (own prompt, own tool, only its own context). The delegation entry nests the specialist's trace (`child_trace`); `agent_runs.parent_run_id` links the runs; `GET /runs/{id}/tree` rebuilds the tree. Specialists return `chunks_found` + `sql_run`, so the orchestrator's citations are checked too. |
 
 ### Database (supabase/migrations)
 
@@ -105,7 +105,7 @@ comments show up immediately. The list of uploaded documents (`describe_document
 
 | Method | Path | Body / params | Returns |
 |---|---|---|---|
-| GET | `/health` | – | `{status, llm_provider, llm_model, database}` |
+| GET | `/health` | – | `{status, llm_provider, llm_model, database, commit}` (`commit` = deployed git SHA on Render) |
 | POST | `/agent/run` | `{task, system_prompt?, output_schema?, mode?: "agent" \| "orchestrator"}` | `{run_id, answer, stopped_reason, trace}` |
 | POST | `/agent/stream` | same JSON body | SSE stream (below) — read with `fetch` + `response.body.getReader()` |
 | GET | `/agent/stream` | `?task=...&system_prompt=...&mode=...` | SSE stream — works with `new EventSource(url)` (no output_schema) |

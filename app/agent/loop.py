@@ -15,9 +15,14 @@ found in this run.
 Tools with requires_approval=True pause the run: the loop records an
 `approval_required` entry, calls approve(call) (which blocks until a human
 decides), records the decision, and only runs the tool if it was approved.
+
+When one LLM response calls several ordinary tools (e.g. both specialists),
+they run at the same time in threads. Results are still recorded in the
+original order, so the trace and the conversation look the same.
 """
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -63,6 +68,26 @@ def _run_tool(tool: Tool | None, name: str, args: dict) -> tuple[Any, str | None
         return f"Error: {type(e).__name__}: {e}", str(e)
 
 
+def _is_plain(call: ToolCall, tools_by_name: dict[str, Tool], output_schema: dict | None) -> bool:
+    """Plain = safe to run in parallel: not the final answer, not waiting for a human."""
+    if call.name == SUBMIT_TOOL_NAME and output_schema:
+        return False
+    tool = tools_by_name.get(call.name)
+    return not (tool and tool.requires_approval)
+
+
+def _run_in_parallel(calls: list[ToolCall], tools_by_name: dict[str, Tool]) -> dict[str, tuple]:
+    """Run tool calls at the same time -> {call.id: (output, error, ms)}."""
+    def timed(call: ToolCall) -> tuple:
+        started = time.monotonic()
+        output, error = _run_tool(tools_by_name.get(call.name), call.name, call.input)
+        return output, error, int((time.monotonic() - started) * 1000)
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        results = list(pool.map(timed, calls))
+    return {call.id: result for call, result in zip(calls, results)}
+
+
 def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int = 10,
               output_schema: dict | None = None,
               on_event: Callable[[dict], None] | None = None,
@@ -104,7 +129,11 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
             force_tool = SUBMIT_TOOL_NAME
             continue
 
-        for call in response.tool_calls:
+        # Several ordinary tool calls in one response: run them at the same time first
+        plain = [c for c in response.tool_calls if _is_plain(c, tools_by_name, output_schema)]
+        prerun = _run_in_parallel(plain, tools_by_name) if len(plain) > 1 else {}
+
+        for call in response.tool_calls:  # record everything in the original order
             started = time.monotonic()
 
             if call.name == SUBMIT_TOOL_NAME and output_schema:
@@ -131,15 +160,19 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
                                    + (f": {reason}" if reason else "") + "). It was NOT run. "
                                    "Do not call it again; tell the user what you would have done instead.")
                 else:
-                    output, error = _run_tool(tool, call.name, call.input)
+                    if call.id in prerun:                     # already ran, in parallel
+                        output, error, ms = prerun[call.id]
+                    else:
+                        output, error = _run_tool(tool, call.name, call.input)
+                        ms = int((time.monotonic() - started) * 1000)
                     output_text = _to_text(output)
-                    entry = {"step": step, "type": "tool", "tool": call.name, "input": call.input}
+                    entry = {"step": step, "type": "tool", "tool": call.name, "input": call.input,
+                             "parallel": call.id in prerun}
                     if error is None:
                         evidence.add(call.name, call.input, output)
                         if tool.trace_fields:
                             entry.update(tool.trace_fields(output))  # e.g. chunk_ids for search_documents
-                    entry.update({"output": _clip(output_text, MAX_TRACE_OUTPUT_CHARS), "error": error,
-                                  "ms": int((time.monotonic() - started) * 1000)})
+                    entry.update({"output": _clip(output_text, MAX_TRACE_OUTPUT_CHARS), "error": error, "ms": ms})
                     record(entry)
 
             messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,

@@ -34,7 +34,7 @@ Placeholders used below — replace them in the Lovable project, never commit re
 
 | Method | Path | Body / params | Returns |
 |---|---|---|---|
-| GET | `/health` | – | `{status, llm_provider, llm_model, database}` |
+| GET | `/health` | – | `{status, llm_provider, llm_model, database, commit}` |
 | POST | `/agent/stream` | JSON `RunRequest` (below) | **SSE stream** — the main endpoint for a chat UI |
 | POST | `/agent/run` | JSON `RunRequest` | `{run_id, answer, stopped_reason, trace}` when finished (no live steps) |
 | GET | `/agent/stream` | `?task=&mode=&api_key=` | SSE stream for `EventSource` (no `output_schema`) |
@@ -128,7 +128,7 @@ Every entry has `step`, `type` and `agent` (`agent`, `orchestrator`, `data_analy
 | `type` | Fields | Display |
 |---|---|---|
 | `llm` | `text`, `tool_calls: [{name, input}]`, `tokens`, `ms` | "Thinking… → calls query_database" |
-| `tool` | `tool`, `input`, `output` (string, max 2000 chars), `error`, `ms`; `chunk_ids` for `search_documents`; `specialist`, `child_run_id`, `child_trace` for delegations | tool name + input (show `input.sql` as code, `input.query` as text) |
+| `tool` | `tool`, `input`, `output` (string, max 2000 chars), `error`, `ms`, `parallel` (ran at the same time as other calls); `chunk_ids` for `search_documents`; `specialist`, `child_run_id`, `child_trace` for delegations | tool name + input (show `input.sql` as code, `input.query` as text) |
 | `approval` | `tool`, `decision` (`approved` \| `rejected` \| `timeout`), `reason`, `waited_ms` | the human decision |
 | `final_answer` | `input`, `valid`, `errors` | if `valid` is false: "answer rejected, retrying" + `errors` |
 | `delegation_started` | `specialist`, `child_run_id`, `question` | orchestrator mode: "Asking data_analyst: …"; that specialist's own steps follow (with their own `agent` and `run_id`) |

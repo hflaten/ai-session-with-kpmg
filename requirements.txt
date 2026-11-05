@@ -5,3 +5,5 @@ psycopg[binary]==3.2.*
 # tests
 pytest==8.*
 httpx==0.28.*
+anthropic>=0.40
+openai>=1.50

@@ -1,5 +1,8 @@
 """CSV / Excel -> one Postgres table per file (or per Excel sheet), via pandas.
 
+Report-style sheets (title rows, two-row headers, totals, footnotes) are
+cleaned first by clean_sheet() in table_layout.py.
+
 Every table gets a comment, and every column gets a comment describing it,
 so the agent sees what the data means in its system prompt (describe_schema).
 Column comments are a generated summary of the data, unless the caller
@@ -15,6 +18,7 @@ from sqlalchemy import create_engine
 
 from app import db
 from app.config import settings
+from app.ingest.table_layout import clean_sheet
 
 RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports"}  # never overwrite the backend's own tables
 MAX_IDENTIFIER = 63                                   # Postgres name length limit
@@ -40,12 +44,12 @@ def unique_identifiers(headers: list) -> list[str]:
 
 
 def read_file(filename: str, data: bytes) -> dict[str | None, pd.DataFrame]:
-    """{sheet name (None for CSV): DataFrame}"""
+    """{sheet name (None for CSV): raw grid}. No header is assumed: clean_sheet() finds it."""
     lower = filename.lower()
     if lower.endswith(".csv"):
-        return {None: pd.read_csv(io.BytesIO(data), sep=None, engine="python")}  # sniffs , or ;
+        return {None: pd.read_csv(io.BytesIO(data), sep=None, engine="python", header=None)}  # sniffs , or ;
     if lower.endswith((".xlsx", ".xlsm", ".xls")):
-        return pd.read_excel(io.BytesIO(data), sheet_name=None)
+        return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None)
     raise ValueError("Upload a .csv or .xlsx file")
 
 
@@ -97,7 +101,8 @@ def _engine():
 def ingest_table(filename: str, data: bytes, column_descriptions: dict[str, str] | None = None) -> dict:
     descriptions = column_descriptions or {}
     used_descriptions: set[str] = set()
-    sheets = {k: v for k, v in read_file(filename, data).items() if not v.empty}
+    cleaned = {sheet: clean_sheet(raw) for sheet, raw in read_file(filename, data).items()}
+    sheets = {sheet: t for sheet, t in cleaned.items() if not t.df.empty}
     if not sheets:
         raise ValueError("The file has no data rows")
 
@@ -105,30 +110,42 @@ def ingest_table(filename: str, data: bytes, column_descriptions: dict[str, str]
     engine = _engine()
     tables = []
     try:
-        for sheet, df in sheets.items():
+        for sheet, clean in sheets.items():
             name = to_identifier(file_stem if len(sheets) == 1 else f"{file_stem}_{sheet}")
             if name in RESERVED_TABLES:
                 raise ValueError(f"'{name}' is reserved; rename the file")
 
-            originals = list(df.columns)
-            df.columns = unique_identifiers(originals)
+            df = clean.df
+            originals = clean.original_headers           # header text as written in the sheet
+            display_names = list(df.columns)
+            df.columns = unique_identifiers(display_names)
             df = df.apply(_parse_dates)
 
             # Column comments: caller's text (matched on original header or new name), else generated
             columns = []
-            for original, column in zip(originals, df.columns):
+            for position, (original, column) in enumerate(zip(originals, df.columns)):
                 key = str(original) if str(original) in descriptions else column
                 if key in descriptions:
                     used_descriptions.add(key)
                     comment = descriptions[key]
                 else:
                     comment = profile_column(original, df[column])
+                    dropped = clean.non_numeric.get(position)
+                    if dropped:
+                        comment += " Non-numeric values left empty: " + ", ".join(f'"{v}"' for v in dropped[:5])
                 columns.append({"name": column, "original_header": str(original), "comment": comment})
 
             df.to_sql(name, engine, schema="public", if_exists="replace", index=False)
 
             table_comment = (f'Uploaded from "{filename}"' + (f', sheet "{sheet}"' if sheet else "")
-                             + f" on {date.today().isoformat()}. {len(df)} rows.")
+                             + f" on {date.today().isoformat()}. {len(df)} rows."
+                             + f" Header taken from sheet row(s) {', '.join(str(r + 1) for r in clean.header_rows)}.")
+            if "section" in df.columns:
+                table_comment += " Sections (stacked tables): " + "; ".join(df["section"].unique()) + "."
+            if clean.skipped_totals:
+                table_comment += f" Skipped {len(clean.skipped_totals)} totals rows: " + "; ".join(clean.skipped_totals) + "."
+            if clean.notes:
+                table_comment += " Notes: " + " | ".join(clean.notes)
             with db.connect() as conn:
                 conn.execute(sql.SQL("comment on table {} is {}").format(
                     sql.Identifier("public", name), sql.Literal(table_comment)))
@@ -136,7 +153,9 @@ def ingest_table(filename: str, data: bytes, column_descriptions: dict[str, str]
                     conn.execute(sql.SQL("comment on column {} is {}").format(
                         sql.Identifier("public", name, col["name"]), sql.Literal(col["comment"])))
 
-            tables.append({"table": name, "rows": len(df), "comment": table_comment, "columns": columns})
+            tables.append({"table": name, "rows": len(df), "comment": table_comment,
+                           "header_rows": [r + 1 for r in clean.header_rows],   # 1-based, as in Excel
+                           "skipped_totals": clean.skipped_totals, "notes": clean.notes, "columns": columns})
     finally:
         engine.dispose()
 

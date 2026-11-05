@@ -40,6 +40,6 @@ def test_profile_numeric_text_and_dates():
     assert "Range 2026-01-01 to 2026-03-01" in dates
 
 
-def test_csv_with_semicolons_is_read():
+def test_csv_with_semicolons_is_read_as_a_raw_grid():
     frames = read_file("x.csv", b"a;b\n1;2\n3;4\n")
-    assert list(frames[None].columns) == ["a", "b"]
+    assert frames[None].shape == (3, 2)          # header row included: clean_sheet() finds it

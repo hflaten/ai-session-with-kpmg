@@ -15,6 +15,7 @@ client = TestClient(app, headers={"X-API-Key": "test-key"})
 def fake_runs(monkeypatch):
     log = {"created": [], "finished": []}
     monkeypatch.setattr(agent_routes, "describe_schema", lambda: "Tables: (stubbed)")
+    monkeypatch.setattr(agent_routes, "describe_documents", lambda: "Docs: (stubbed)")
     monkeypatch.setattr(agent_routes.runs, "create_run", lambda task, **kw: log["created"].append(task) or "run-1")
     monkeypatch.setattr(agent_routes.runs, "finish_run",
                         lambda run_id, status, trace, **kw: log["finished"].append((run_id, status, len(trace), kw)))

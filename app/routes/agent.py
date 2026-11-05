@@ -22,6 +22,7 @@ from app.agent import run_agent
 from app.agent.structured import check_output_schema
 from app.llm import Tool
 from app.tools.database import describe_schema, query_database_tool
+from app.tools.documents import describe_documents, search_documents_tool
 
 router = APIRouter()
 
@@ -30,8 +31,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "Be concise and say when you are unsure."
 )
 
-# Tools available to the agent. search_documents is added in step 7.
-TOOLS: list[Tool] = [query_database_tool]
+# Tools available to the agent.
+TOOLS: list[Tool] = [query_database_tool, search_documents_tool]
 
 
 class RunRequest(BaseModel):
@@ -49,16 +50,18 @@ def _validate(req: RunRequest) -> None:
 
 
 def build_system_prompt(custom: str | None) -> str:
-    """Caller's prompt (or the default) + the current table schemas.
+    """Caller's prompt (or the default) + the current tables and documents.
 
-    The schema is read fresh each run, so newly uploaded tables show up.
-    If the database is unreachable the agent still runs, just without it.
+    Read fresh each run (no caching), so new uploads show up immediately.
+    If the database is unreachable the agent still runs, just without them.
     """
-    base = custom or DEFAULT_SYSTEM_PROMPT
-    try:
-        return f"{base}\n\n{describe_schema()}"
-    except Exception:
-        return base
+    parts = [custom or DEFAULT_SYSTEM_PROMPT]
+    for describe in (describe_schema, describe_documents):
+        try:
+            parts.append(describe())
+        except Exception:
+            pass
+    return "\n\n".join(parts)
 
 
 def execute(req: RunRequest, on_event: Callable[[dict], None] | None = None) -> dict:

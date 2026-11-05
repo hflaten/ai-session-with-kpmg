@@ -8,14 +8,17 @@ back -> repeat. Stops when the LLM gives its final answer, or after max_steps.
 Every LLM call and tool call is recorded in result.trace.
 
 With output_schema, the final answer must come through the submit_answer tool
-(see structured.py) and is validated against the schema.
+(see structured.py). It is validated against the schema, it always contains a
+`sources` list, and every source is checked against what the agent actually
+found in this run.
 """
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
-from app.agent.structured import SUBMIT_TOOL_NAME, make_submit_tool, validation_errors
+from app.agent.structured import (SUBMIT_TOOL_NAME, Evidence, citation_errors, make_submit_tool,
+                                  validation_errors, with_sources)
 from app.llm import Tool, call_llm
 
 MAX_TOOL_OUTPUT_CHARS = 20_000   # what the LLM sees from one tool call
@@ -37,12 +40,12 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f"… [truncated, {len(text)} chars]"
 
 
-def _run_tool(tool: Tool | None, name: str, args: dict) -> tuple[str, str | None]:
-    """Run one tool. Errors are returned to the LLM as text so it can recover."""
+def _run_tool(tool: Tool | None, name: str, args: dict) -> tuple[Any, str | None]:
+    """Run one tool -> (output, error). Errors become text for the LLM so it can recover."""
     if tool is None or tool.run is None:
         return f"Error: unknown tool '{name}'", "unknown tool"
     try:
-        return _to_text(tool.run(**args)), None
+        return tool.run(**args), None
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}", str(e)
 
@@ -52,17 +55,19 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
               on_event: Callable[[dict], None] | None = None) -> AgentResult:
     tools = list(tools)
     if output_schema:
+        output_schema = with_sources(output_schema)  # every structured answer cites its sources
         tools.append(make_submit_tool(output_schema))
     tools_by_name = {t.name: t for t in tools}
 
     messages: list[dict] = [{"role": "user", "content": task}]
     trace: list[dict] = []
-    force_tool = None  # set when the model must call submit_answer next
+    evidence = Evidence()  # chunks found and SQL run, for checking citations
+    force_tool = None      # set when the model must call submit_answer next
 
     def record(entry: dict) -> None:
         trace.append(entry)
         if on_event:
-            on_event(entry)  # used for live streaming in step 6
+            on_event(entry)  # used for live streaming
 
     for step in range(1, max_steps + 1):
         started = time.monotonic()
@@ -90,22 +95,29 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
 
             if call.name == SUBMIT_TOOL_NAME and output_schema:
                 errors = validation_errors(output_schema, call.input)
+                if not errors:
+                    errors = citation_errors(call.input["sources"], evidence)
                 record({"step": step, "type": "final_answer", "input": call.input, "valid": not errors,
                         "errors": errors, "ms": int((time.monotonic() - started) * 1000)})
                 if not errors:
                     return AgentResult(answer=call.input, trace=trace)
-                output = "Your answer does not match the schema. Fix these and call submit_answer again:\n" \
-                         + "\n".join(errors)
+                output_text = ("Your answer was rejected. Fix these and call submit_answer again:\n"
+                               + "\n".join(errors))
             else:
-                output, error = _run_tool(tools_by_name.get(call.name), call.name, call.input)
-                record({
-                    "step": step, "type": "tool", "tool": call.name, "input": call.input,
-                    "output": _clip(output, MAX_TRACE_OUTPUT_CHARS), "error": error,
-                    "ms": int((time.monotonic() - started) * 1000),
-                })
+                tool = tools_by_name.get(call.name)
+                output, error = _run_tool(tool, call.name, call.input)
+                output_text = _to_text(output)
+                entry = {"step": step, "type": "tool", "tool": call.name, "input": call.input}
+                if error is None:
+                    evidence.add(call.name, call.input, output)
+                    if tool.trace_fields:
+                        entry.update(tool.trace_fields(output))  # e.g. chunk_ids for search_documents
+                entry.update({"output": _clip(output_text, MAX_TRACE_OUTPUT_CHARS), "error": error,
+                              "ms": int((time.monotonic() - started) * 1000)})
+                record(entry)
 
             messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name,
-                             "content": _clip(output, MAX_TOOL_OUTPUT_CHARS)})
+                             "content": _clip(output_text, MAX_TOOL_OUTPUT_CHARS)})
 
     return AgentResult(answer=f"Stopped after {max_steps} steps without a final answer.",
                        trace=trace, stopped_reason="max_steps")

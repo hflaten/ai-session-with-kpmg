@@ -59,4 +59,5 @@ def test_system_prompt_survives_db_failure(monkeypatch):
     def boom():
         raise ConnectionError("db down")
     monkeypatch.setattr(agent_routes, "describe_schema", boom)
+    monkeypatch.setattr(agent_routes, "describe_documents", boom)
     assert agent_routes.build_system_prompt("Be brief.") == "Be brief."

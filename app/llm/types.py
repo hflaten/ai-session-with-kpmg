@@ -20,6 +20,7 @@ class Tool:
     input_schema: dict                       # JSON schema of the arguments
     run: Callable[..., Any] | None = None    # python function called with the arguments
     requires_approval: bool = False          # step 8: pause for a human first
+    trace_fields: Callable[[Any], dict] | None = None  # extra fields for the trace, from the output
 
 
 @dataclass

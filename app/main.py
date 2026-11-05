@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import require_api_key
 from app.config import cors_origin_regex, settings
-from app.routes import agent, health
+from app.routes import agent, health, uploads
 
 app = FastAPI(title="ai-session-with-kpmg")
 
@@ -21,3 +21,4 @@ app.add_middleware(
 
 app.include_router(health.router)                                          # open
 app.include_router(agent.router, dependencies=[Depends(require_api_key)])  # needs X-API-Key
+app.include_router(uploads.router, dependencies=[Depends(require_api_key)])

@@ -29,17 +29,17 @@ def submit(args, id="s1"):
 
 
 def test_valid_submission_is_the_answer(monkeypatch):
-    calls = scripted(monkeypatch, [submit({"region": "Oslo", "margin_pct": 46.3})])
+    calls = scripted(monkeypatch, [submit({"region": "Oslo", "margin_pct": 46.3, "sources": []})])
     r = loop.run_agent("sys", [], "q", output_schema=SCHEMA)
-    assert r.answer == {"region": "Oslo", "margin_pct": 46.3}
+    assert r.answer == {"region": "Oslo", "margin_pct": 46.3, "sources": []}
     assert calls[0]["tools"] == ["submit_answer"]
     assert r.trace[-1]["type"] == "final_answer" and r.trace[-1]["valid"]
 
 
 def test_invalid_submission_gets_errors_and_retries(monkeypatch):
     calls = scripted(monkeypatch, [
-        submit({"region": "Oslo", "margin_pct": "high"}, "s1"),
-        submit({"region": "Oslo", "margin_pct": 46.3}, "s2"),
+        submit({"region": "Oslo", "margin_pct": "high", "sources": []}, "s1"),
+        submit({"region": "Oslo", "margin_pct": 46.3, "sources": []}, "s2"),
     ])
     r = loop.run_agent("sys", [], "q", output_schema=SCHEMA)
     assert r.answer["margin_pct"] == 46.3
@@ -48,7 +48,7 @@ def test_invalid_submission_gets_errors_and_retries(monkeypatch):
 
 
 def test_plain_text_reply_forces_submit_answer(monkeypatch):
-    calls = scripted(monkeypatch, [LLMResponse(text="Oslo, 46%"), submit({"region": "Oslo", "margin_pct": 46.0})])
+    calls = scripted(monkeypatch, [LLMResponse(text="Oslo, 46%"), submit({"region": "Oslo", "margin_pct": 46.0, "sources": []})])
     r = loop.run_agent("sys", [], "q", output_schema=SCHEMA)
     assert calls[0]["force_tool"] is None
     assert calls[1]["force_tool"] == "submit_answer"

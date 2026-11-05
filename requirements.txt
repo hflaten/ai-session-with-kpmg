@@ -1,10 +1,24 @@
+# web server
 fastapi==0.115.*
 uvicorn[standard]==0.32.*
 python-dotenv==1.0.*
+python-multipart>=0.0.9 # file uploads
+
+# database
 psycopg[binary]==3.2.*
-# tests
+sqlalchemy>=2.0         # pandas.to_sql needs an engine
+
+# LLM
+anthropic>=0.40
+openai>=1.50            # also used for embeddings
+jsonschema>=4.20        # validates structured answers
+
+# uploads and RAG
+pandas>=2.2
+openpyxl>=3.1           # Excel support for pandas
+pypdf>=5.0              # PDF text extraction
+
+# tests and scripts
 pytest==8.*
 httpx==0.28.*
-anthropic>=0.40
-openai>=1.50
-jsonschema>=4.20
+fpdf2>=2.8              # only for scripts/make_test_pdf.py

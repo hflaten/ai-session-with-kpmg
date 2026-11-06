@@ -1,7 +1,12 @@
 """CSV / Excel -> one Postgres table per file (or per Excel sheet), via pandas.
 
 Report-style sheets (title rows, two-row headers, totals, footnotes) are
-cleaned first by clean_sheet() in table_layout.py.
+cleaned first by clean_sheet() in table_layout.py. Tidy CSVs (one header row,
+plain data) skip that step: read_tidy_csv() loads them directly, which uses far
+less memory for big files (the free Render instance has 512 MB).
+
+Rows are written with Postgres COPY (fast, low memory), in one transaction with
+the table and column comments.
 
 Every table gets a comment, and every column gets a comment describing it,
 so the agent sees what the data means in its system prompt (describe_schema).
@@ -14,11 +19,8 @@ from datetime import date
 
 import pandas as pd
 from psycopg import sql
-from sqlalchemy import create_engine
-
 from app import db
-from app.config import settings
-from app.ingest.table_layout import clean_sheet
+from app.ingest.table_layout import clean_sheet, read_tidy_csv
 
 RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports", "claim_reviews", "proposed_orders"}  # never overwrite the backend's own tables
 MAX_IDENTIFIER = 63                                   # Postgres name length limit
@@ -111,74 +113,100 @@ def profile_column(original_header, series: pd.Series) -> str:
     return " ".join(parts)
 
 
-def _engine():
-    # SQLAlchemy needs the driver in the URL: postgresql+psycopg://
-    return create_engine(re.sub(r"^postgres(ql)?://", "postgresql+psycopg://", settings.db_url))
+def sql_type(series: pd.Series) -> str:
+    """Postgres column type for a (tidied) pandas column."""
+    if pd.api.types.is_bool_dtype(series):
+        return "boolean"
+    if pd.api.types.is_integer_dtype(series):
+        return "bigint"
+    if pd.api.types.is_float_dtype(series):
+        return "double precision"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "timestamp"
+    values = series.dropna()
+    if len(values) and all(isinstance(v, date) for v in values):
+        return "date"
+    return "text"
+
+
+def _plain(v):
+    """numpy / pandas values -> plain Python values for COPY (empty -> NULL)."""
+    if v is None or v is pd.NA or (not isinstance(v, (str, bytes)) and pd.isna(v)):
+        return None
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    return v.item() if hasattr(v, "item") else v
+
+
+def write_table(conn, name: str, df: pd.DataFrame) -> None:
+    """Replace public.<name> with the DataFrame's rows (types from sql_type)."""
+    table = sql.Identifier("public", name)
+    columns = sql.SQL(", ").join(sql.SQL("{} {}").format(sql.Identifier(c), sql.SQL(sql_type(df[c])))
+                                 for c in df.columns)
+    conn.execute(sql.SQL("drop table if exists {}").format(table))
+    conn.execute(sql.SQL("create table {} ({})").format(table, columns))
+    with conn.cursor().copy(sql.SQL("copy {} from stdin").format(table)) as copy:
+        for row in df.itertuples(index=False, name=None):
+            copy.write_row([_plain(v) for v in row])
 
 
 def ingest_table(filename: str, data: bytes, column_descriptions: dict[str, str] | None = None) -> dict:
     descriptions = column_descriptions or {}
     used_descriptions: set[str] = set()
-    cleaned = {sheet: clean_sheet(raw) for sheet, raw in read_file(filename, data).items()}
+    tidy = read_tidy_csv(data) if filename.lower().endswith(".csv") else None
+    cleaned = {None: tidy} if tidy else {sheet: clean_sheet(raw) for sheet, raw in read_file(filename, data).items()}
     sheets = {sheet: t for sheet, t in cleaned.items() if not t.df.empty}
     if not sheets:
         raise ValueError("The file has no data rows")
 
     file_stem = re.sub(r"\.[^.]+$", "", filename)
-    engine = _engine()
     tables = []
-    try:
-        for sheet, clean in sheets.items():
-            name = to_identifier(file_stem if len(sheets) == 1 else f"{file_stem}_{sheet}")
-            if name in RESERVED_TABLES:
-                raise ValueError(f"'{name}' is reserved; rename the file")
+    for sheet, clean in sheets.items():
+        name = to_identifier(file_stem if len(sheets) == 1 else f"{file_stem}_{sheet}")
+        if name in RESERVED_TABLES:
+            raise ValueError(f"'{name}' is reserved; rename the file")
 
-            df = clean.df
-            originals = clean.original_headers           # header text as written in the sheet
-            display_names = list(df.columns)
-            df.columns = unique_identifiers(display_names)
-            df = df.apply(_parse_dates).apply(_tidy_types)
+        df = clean.df
+        originals = clean.original_headers           # header text as written in the sheet
+        display_names = list(df.columns)
+        df.columns = unique_identifiers(display_names)
+        df = df.apply(_parse_dates).apply(_tidy_types)
 
-            # Column comments: caller's text (matched on original header or new name), else generated
-            columns = []
-            for position, (original, column) in enumerate(zip(originals, df.columns)):
-                key = str(original) if str(original) in descriptions else column
-                if key in descriptions:
-                    used_descriptions.add(key)
-                    comment = descriptions[key]
-                else:
-                    comment = profile_column(original, df[column])
-                    if position in clean.fractions:
-                        comment += " Fraction, not percent: 0.51 = 51%."
-                    dropped = clean.non_numeric.get(position)
-                    if dropped:
-                        comment += " Non-numeric values left empty: " + ", ".join(f'"{v}"' for v in dropped[:5])
-                columns.append({"name": column, "original_header": str(original), "comment": comment})
+        # Column comments: caller's text (matched on original header or new name), else generated
+        columns = []
+        for position, (original, column) in enumerate(zip(originals, df.columns)):
+            key = str(original) if str(original) in descriptions else column
+            if key in descriptions:
+                used_descriptions.add(key)
+                comment = descriptions[key]
+            else:
+                comment = profile_column(original, df[column])
+                if position in clean.fractions:
+                    comment += " Fraction, not percent: 0.51 = 51%."
+                dropped = clean.non_numeric.get(position)
+                if dropped:
+                    comment += " Non-numeric values left empty: " + ", ".join(f'"{v}"' for v in dropped[:5])
+            columns.append({"name": column, "original_header": str(original), "comment": comment})
 
-            # multi-row INSERTs in chunks: much faster than row by row (Postgres allows 65535 parameters)
-            df.to_sql(name, engine, schema="public", if_exists="replace", index=False,
-                      method="multi", chunksize=max(1, 60000 // max(1, len(df.columns))))
+        table_comment = (f'Uploaded from "{filename}"' + (f', sheet "{sheet}"' if sheet else "")
+                         + f" on {date.today().isoformat()}. {len(df)} rows."
+                         + f" Header taken from sheet row(s) {', '.join(str(r + 1) for r in clean.header_rows)}.")
+        if "section" in df.columns:
+            table_comment += " Sections (stacked tables): " + "; ".join(df["section"].unique()) + "."
+        if clean.skipped_totals:
+            table_comment += f" Skipped {len(clean.skipped_totals)} totals rows: " + "; ".join(clean.skipped_totals) + "."
+        if clean.notes:
+            table_comment += " Notes: " + " | ".join(clean.notes)
+        with db.connect() as conn:   # one transaction: table, rows and comments
+            write_table(conn, name, df)
+            conn.execute(sql.SQL("comment on table {} is {}").format(
+                sql.Identifier("public", name), sql.Literal(table_comment)))
+            for col in columns:
+                conn.execute(sql.SQL("comment on column {} is {}").format(
+                    sql.Identifier("public", name, col["name"]), sql.Literal(col["comment"])))
 
-            table_comment = (f'Uploaded from "{filename}"' + (f', sheet "{sheet}"' if sheet else "")
-                             + f" on {date.today().isoformat()}. {len(df)} rows."
-                             + f" Header taken from sheet row(s) {', '.join(str(r + 1) for r in clean.header_rows)}.")
-            if "section" in df.columns:
-                table_comment += " Sections (stacked tables): " + "; ".join(df["section"].unique()) + "."
-            if clean.skipped_totals:
-                table_comment += f" Skipped {len(clean.skipped_totals)} totals rows: " + "; ".join(clean.skipped_totals) + "."
-            if clean.notes:
-                table_comment += " Notes: " + " | ".join(clean.notes)
-            with db.connect() as conn:
-                conn.execute(sql.SQL("comment on table {} is {}").format(
-                    sql.Identifier("public", name), sql.Literal(table_comment)))
-                for col in columns:
-                    conn.execute(sql.SQL("comment on column {} is {}").format(
-                        sql.Identifier("public", name, col["name"]), sql.Literal(col["comment"])))
-
-            tables.append({"table": name, "rows": len(df), "comment": table_comment,
-                           "header_rows": [r + 1 for r in clean.header_rows],   # 1-based, as in Excel
-                           "skipped_totals": clean.skipped_totals, "notes": clean.notes, "columns": columns})
-    finally:
-        engine.dispose()
+        tables.append({"table": name, "rows": len(df), "comment": table_comment,
+                       "header_rows": [r + 1 for r in clean.header_rows],   # 1-based, as in Excel
+                       "skipped_totals": clean.skipped_totals, "notes": clean.notes, "columns": columns})
 
     return {"tables": tables, "unused_column_descriptions": sorted(set(descriptions) - used_descriptions)}

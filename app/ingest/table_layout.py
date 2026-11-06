@@ -23,6 +23,7 @@ clean_sheet() reads the raw grid (no header assumed) and:
 8. names "%" columns by what they hold: 0-1 fractions get no "pct" (comment says
    "fraction, 0.51 = 51%"); values above 1 are percentages and get "pct".
 """
+import io
 import math
 import re
 from dataclasses import dataclass, field
@@ -297,3 +298,33 @@ def clean_sheet(raw: pd.DataFrame) -> CleanTable:
     return CleanTable(df=df, original_headers=originals, notes=notes, skipped_totals=totals,
                       non_numeric=non_numeric, fractions=fractions,
                       header_rows=[int(grid.index[p]) for p in header_pos])
+
+
+# ---------- fast path for tidy CSVs ----------
+
+def read_tidy_csv(data: bytes) -> CleanTable | None:
+    """A CSV that is already a clean table, read directly by pandas; None if it needs clean_sheet().
+
+    Tidy = the first row is the header (text labels, unique, no "%" names) and the rows below
+    are plain data: no footnote rows, no totals rows, no repeated header rows. Uses much less
+    memory than clean_sheet() on big files.
+    """
+    first_line = data[:20_000].decode("utf-8", errors="ignore").splitlines()[0] if data else ""
+    sep = ";" if first_line.count(";") > first_line.count(",") else ","
+    try:
+        df = pd.read_csv(io.BytesIO(data), sep=sep)
+    except (ValueError, pd.errors.ParserError):
+        return None
+    headers = [str(c) for c in df.columns]
+    if (df.empty or any(h.startswith("Unnamed:") or "%" in h or not _is_label(h) or _is_year(h) for h in headers)
+            or len(set(headers)) != len(headers)):
+        return None
+    if len(headers) > 2 and (df.notna().sum(axis=1) == 1).any():          # footnote rows
+        return None
+    text = df.select_dtypes(include=["object", "string"])
+    if not text.empty:
+        if text.iloc[:, 0].dropna().astype(str).str.strip().str.match(TOTAL_LABEL).any():   # totals rows
+            return None
+        if (text.astype(str) == pd.Series(headers, index=df.columns)[text.columns]).all(axis=1).any():  # repeated header
+            return None
+    return CleanTable(df=df, original_headers=headers, header_rows=[0])

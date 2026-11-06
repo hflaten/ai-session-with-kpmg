@@ -138,7 +138,7 @@ def test_fraction_comment_on_upload(monkeypatch):
             written.setdefault("stmts", []).append(stmt)
 
     monkeypatch.setattr(tabular.db, "connect", lambda: FakeConn())
-    monkeypatch.setattr(pd.DataFrame, "to_sql", lambda self, *a, **kw: None)
+    monkeypatch.setattr(tabular, "write_table", lambda conn, name, df: None)
     result = tabular.ingest_table("report.xlsx", xlsx_bytes(REPORT, ["D5:F5"]))
     margin = next(c for c in result["tables"][0]["columns"] if c["name"] == "margin")
     assert margin["original_header"] == "Margin / %"
@@ -161,3 +161,25 @@ def test_types_are_tidied_booleans_integers_dates():
     assert tidy([1.0, 2.0]) == [1, 2]
     assert tidy([1.5, 2.0]) == [1.5, 2.0]
     assert tidy(["2026-01-01", "2026-02-03"]) == [datetime.date(2026, 1, 1), datetime.date(2026, 2, 3)]
+
+
+def test_tidy_csv_fast_path_and_messy_csv_fallback():
+    from app.ingest.table_layout import read_tidy_csv
+    tidy = read_tidy_csv(b"sku,units,on_promo,weekdays\nA,1,True,\"0,2,4\"\nB,2,False,1\n")
+    assert tidy is not None and list(tidy.df.columns) == ["sku", "units", "on_promo", "weekdays"]
+    assert tidy.df["weekdays"].tolist() == ["0,2,4", "1"]
+    assert read_tidy_csv(b"a;b\n1;2\n").df.shape == (1, 2)                       # semicolons
+    assert read_tidy_csv(b"Region,Revenue,Cost\nOslo,1,2\nTotal,1,2\n") is None   # totals row
+    assert read_tidy_csv(b"Region,Revenue,Cost\nOslo,1,2\n* footnote,,\n") is None
+    assert read_tidy_csv(b"Region,Margin %\nOslo,45%\n") is None                   # % columns: clean_sheet
+    assert read_tidy_csv(b",,\nReport,,\nRegion,Revenue,Cost\n") is None          # title rows
+
+
+def test_sql_types_for_tidied_columns():
+    import datetime
+    from app.ingest.tabular import sql_type
+    assert sql_type(pd.Series([True, False])) == "boolean"
+    assert sql_type(pd.Series([1, 2], dtype="Int64")) == "bigint"
+    assert sql_type(pd.Series([1.5])) == "double precision"
+    assert sql_type(pd.Series([datetime.date(2026, 1, 1), None])) == "date"
+    assert sql_type(pd.Series(["x"])) == "text"

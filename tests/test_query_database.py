@@ -88,7 +88,7 @@ def test_run_tree_nests_children():
     parent = runs.create_run("tree test", agent_name="orchestrator")
     try:
         a = runs.create_run("child a", agent_name="data_analyst", parent_run_id=parent)
-        b = runs.create_run("child b", agent_name="document_researcher", parent_run_id=parent)
+        b = runs.create_run("child b", agent_name="inventory_planner", parent_run_id=parent)
         tree = runs.get_tree(parent)
         assert tree["agent_name"] == "orchestrator"
         assert [c["id"] for c in tree["children"]] == [a, b]

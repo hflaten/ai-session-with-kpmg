@@ -1,9 +1,13 @@
-"""Orchestrator pattern: one coordinating agent and two specialists.
+"""Orchestrator pattern: one coordinating agent and two specialists (Høyden inventory case).
 
-A specialist is just run_agent() with its own system prompt and tools.
-The orchestrator has no data access of its own: its tools are
-`ask_data_analyst` and `ask_document_researcher`, which each start a
-specialist run (logged in agent_runs with parent_run_id = the orchestrator's run).
+A specialist is just run_agent() with its own system prompt and tools:
+- data_analyst:      query_database + recommend_orders (numbers in the tables, and order plans)
+- inventory_planner: recommend_orders only (what/when/how much to order, stockouts, waste, overstock)
+
+The orchestrator has no data access of its own: its tools are `ask_data_analyst` and
+`ask_inventory_planner`, which each start a specialist run (logged in agent_runs with
+parent_run_id = the orchestrator's run), plus the write tools create_purchase_order and
+save_report, which both need human approval (see service.tools_for_run).
 
 The delegation tree is visible in three places:
 - the orchestrator's trace: each delegation entry carries child_run_id + child_trace,
@@ -19,12 +23,15 @@ from app.agent.loop import run_agent
 from app.llm import Tool
 from app.tools.database import query_database_tool
 from app.tools.inventory import recommend_orders_tool
-from app.tools.documents import search_documents_tool
 
 ORCHESTRATOR_PROMPT = (
     "You coordinate two specialists and have no direct access to data yourself.\n"
-    "- ask_data_analyst: questions about numbers in the database tables.\n"
-    "- ask_document_researcher: questions about what the uploaded documents say.\n"
+    "- ask_inventory_planner: what, when and how much to order; stockout risk, expected waste and "
+    "overstock (deterministic order plan).\n"
+    "- ask_data_analyst: other questions about numbers in the database tables (sales, stock value, waste "
+    "history, suppliers), and it can also check the order plan.\n"
+    "You can create purchase orders yourself with create_purchase_order (a human must approve each one), "
+    "but only when the user asks you to place or create orders; use the quantities and dates the planner gave.\n"
     "Split the user's task into focused questions, delegate them (both at once when they are "
     "independent), then combine the answers. Each specialist reports `chunks_found`, `sql_run` and `tools_run`: "
     "cite those exact chunk_ids, SQL and tool calls (tool + arguments) in your sources. Never invent numbers or citations."
@@ -38,7 +45,7 @@ class Specialist:
     system_prompt: str
     tools: list[Tool]
     sees_tables: bool = False      # put the table list in its prompt?
-    sees_documents: bool = False   # put the document list in its prompt?
+    sees_documents: bool = False   # put the document list in its prompt? (no current specialist does)
 
 
 SPECIALISTS = [
@@ -53,12 +60,14 @@ SPECIALISTS = [
         sees_tables=True,
     ),
     Specialist(
-        name="document_researcher",
-        description="Finds what the uploaded documents say, with document names and page numbers.",
-        system_prompt=("You are a document researcher. Answer the question with search_documents. Quote or "
-                       "closely paraphrase the text, and name the document, page and chunk_id for each fact."),
-        tools=[search_documents_tool],
-        sees_documents=True,
+        name="inventory_planner",
+        description=("Plans orders with the deterministic order planner: what, when and how much to order, "
+                     "stockout risk dates, expected waste and overstock, with NOK consequences."),
+        system_prompt=("You are an inventory planner. Answer with recommend_orders only (filter by location_id "
+                       "and/or sku for details). Give the exact quantities, order dates, stockout dates and NOK "
+                       "figures it returns, say which location and product each one is for, and keep it short. "
+                       "Never invent numbers the tool did not return."),
+        tools=[recommend_orders_tool],
     ),
 ]
 

@@ -68,7 +68,8 @@ Placeholders used below — replace them in the Lovable project, never commit re
 ```
 
 - `mode`: `"agent"` (one agent with all tools, faster) or `"orchestrator"` (delegates to a
-  `data_analyst` and a `document_researcher`; slower, shows a delegation tree).
+  `data_analyst` and an `inventory_planner`; slower, shows a delegation tree. The orchestrator can
+  also propose purchase orders with `create_purchase_order`, which waits for approval).
 - `output_schema` (optional, recommended): JSON schema with `"type": "object"` at the top.
   With a schema, `answer` is an object and **always includes `sources`** (don't define
   `sources` yourself). Without one, `answer` is a plain Markdown string with no sources.
@@ -128,7 +129,7 @@ export async function streamAgent(body: object, onEvent: Handler, signal?: Abort
 
 ### Trace entries (`step` events)
 
-Every entry has `step`, `type` and `agent` (`agent`, `orchestrator`, `data_analyst`, `document_researcher`).
+Every entry has `step`, `type` and `agent` (`agent`, `orchestrator`, `data_analyst`, `inventory_planner`).
 
 | `type` | Fields | Display |
 |---|---|---|
@@ -466,7 +467,7 @@ STREAM EVENTS
     type "delegation_started": "➡️ Asking {data.specialist}: {data.question}".
     type "approval": "✅/❌ {data.decision} by human: {data.reason}".
     type "final_answer": if data.valid is false show "Answer rejected, retrying" + data.errors.
-  Entries whose data.agent is "data_analyst" or "document_researcher" are specialist steps:
+  Entries whose data.agent is "data_analyst" or "inventory_planner" are specialist steps:
   indent them and show a coloured agent badge, so the trace looks like a delegation tree.
 - "approval_required": data { run_id, tool, input }. The run is PAUSED. Show an amber card in
   the chat: "The agent wants to run {tool}". For tool "save_report" show input.title and

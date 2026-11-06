@@ -4,6 +4,7 @@
 
 - document source -> the chunk's original text (from document_chunks)
 - database source -> the rows, by re-running the cited SQL as agent_readonly
+- tool source     -> the result, by re-running the cited (deterministic) tool with the cited arguments
 
 Only SQL stored in the run's validated answer is re-run (it passed the citation
 check, so the agent really ran it). The browser never sends SQL.
@@ -12,6 +13,9 @@ Each source also gets its inline `marker` ([n] = index + 1) and its latest human
 """
 from app import db, reviews, runs
 from app.tools.database import query_database
+from app.tools.inventory import recommend_orders
+
+CITABLE = {"recommend_orders": recommend_orders}   # tool name -> function, for re-running tool sources
 
 
 def _chunk_text(chunk_id: str) -> str | None:
@@ -37,6 +41,12 @@ def resolve_sources(run_id: str) -> list[dict] | None:
             text = _chunk_text(s["chunk_id"])
             resolved.append({**base, "kind": "document", **s, "text": text,
                              "error": None if text is not None else "chunk no longer exists (document re-uploaded or reset)"})
+        elif "tool" in s:
+            try:
+                result = CITABLE[s["tool"]](**s["arguments"])
+                resolved.append({**base, "kind": "tool", **s, "result": result, "error": None})
+            except Exception as e:
+                resolved.append({**base, "kind": "tool", **s, "result": None, "error": f"{type(e).__name__}: {e}"})
         elif "sql" in s:
             try:
                 result = query_database(s["sql"])

@@ -6,7 +6,9 @@ execute() is shared by /agent/run and /agent/stream. It:
 3. runs the agent, pausing for human approval on flagged tools,
 4. saves the answer, trace and status.
 """
+import re
 import time
+from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import BaseModel
@@ -18,7 +20,19 @@ from app.agent.orchestrator import ORCHESTRATOR_PROMPT, make_delegation_tools
 from app.llm import Tool, ToolCall
 from app.tools.database import describe_schema, query_database_tool
 from app.tools.documents import describe_documents, search_documents_tool
+from app.tools.inventory import make_create_purchase_order_tool, recommend_orders_tool
 from app.tools.reports import make_save_report_tool
+
+BUSINESS_CONTEXT_FILE = Path(__file__).resolve().parent.parent / "business_context.md"
+
+
+def business_context() -> str:
+    """The current case's background (app/business_context.md, HTML comments removed). "" if none."""
+    if not BUSINESS_CONTEXT_FILE.exists():
+        return ""
+    text = re.sub(r"<!--.*?-->", "", BUSINESS_CONTEXT_FILE.read_text(encoding="utf-8"), flags=re.DOTALL).strip()
+    return f"Business context for this case:\n{text}" if text else ""
+
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful analyst. Use the available tools when they help. "
@@ -34,13 +48,15 @@ class RunRequest(BaseModel):
 
 
 def build_system_prompt(custom: str | None, tables: bool = True, documents: bool = True) -> str:
-    """Caller's prompt (or the default) + the current tables and/or documents.
+    """Caller's prompt (or the default) + business context + the current tables and/or documents.
 
     Read fresh each run (no caching), so new uploads show up immediately.
     Specialists only get the context for their own tool (tables OR documents).
     If the database is unreachable the agent still runs, just without them.
     """
     parts = [custom or DEFAULT_SYSTEM_PROMPT]
+    if business_context():
+        parts.append(business_context())
     describers = ([describe_schema] if tables else []) + ([describe_documents] if documents else [])
     for describe in describers:
         try:
@@ -52,10 +68,11 @@ def build_system_prompt(custom: str | None, tables: bool = True, documents: bool
 
 def tools_for_run(run_id: str, mode: str = "agent", emit: Callable[[dict], None] | None = None) -> list[Tool]:
     if mode == "orchestrator":
-        # No direct data access: only delegation (+ the flagged save_report)
+        # No direct data access: only delegation (+ the flagged write tools)
         return [*make_delegation_tools(run_id, emit or (lambda e: None), build_system_prompt),
-                make_save_report_tool(run_id)]
-    return [query_database_tool, search_documents_tool, make_save_report_tool(run_id)]
+                make_save_report_tool(run_id), make_create_purchase_order_tool(run_id)]
+    return [query_database_tool, search_documents_tool, recommend_orders_tool,
+            make_save_report_tool(run_id), make_create_purchase_order_tool(run_id)]
 
 
 def make_approver(run_id: str, trace: list[dict]):

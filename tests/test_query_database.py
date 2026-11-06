@@ -8,17 +8,35 @@ from app.tools.database import MAX_ROWS, describe_schema, query_database
 pytestmark = pytest.mark.skipif(not settings.readonly_db_url, reason="no SUPABASE_READONLY_DB_URL")
 
 
+TABLE = "zz_test_sales"   # created for these tests (the real data is reset before each case)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def demo_table():
+    from app import db
+    with db.connect() as conn:
+        conn.execute(f"drop table if exists public.{TABLE}")
+        conn.execute(f"create table public.{TABLE} (region text, revenue numeric(12,2))")
+        conn.execute(f"insert into public.{TABLE} values ('Bergen', 1000000), ('Bergen', 22500), ('Oslo', 5)")
+        conn.execute(f"comment on table public.{TABLE} is 'Demo data for tests'")
+        conn.execute(f"comment on column public.{TABLE}.revenue is 'Revenue in NOK, excluding VAT'")
+    yield
+    with db.connect() as conn:
+        conn.execute(f"drop table if exists public.{TABLE}")
+
+
 def test_select_returns_columns_and_plain_numbers():
-    r = query_database("select region, sum(revenue) as revenue from sample_sales group by region order by region")
+    r = query_database(f"select region, sum(revenue) as revenue from {TABLE} group by region order by region")
     assert r["columns"] == ["region", "revenue"]
     assert r["rows"][0] == {"region": "Bergen", "revenue": 1022500.0}
 
 
 @pytest.mark.parametrize("sql", [
-    "delete from sample_sales",
-    "update sample_sales set units = 0",
+    f"delete from {TABLE}",
+    f"update {TABLE} set revenue = 0",
     "create table hack(x int)",
     "select * from agent_runs",
+    "insert into proposed_orders (sku, location_id, qty, order_date, status, source) values ('x', 'y', 1, now(), 'approved', 'agent')",
 ])
 def test_writes_and_run_logs_are_blocked(sql):
     with pytest.raises(Exception):
@@ -32,7 +50,7 @@ def test_row_limit():
 
 def test_schema_lists_readable_tables_with_comments():
     text = describe_schema()
-    assert "- sample_sales  -- Demo data" in text                          # table comment
+    assert f"- {TABLE}  -- Demo data for tests" in text                          # table comment
     assert "    revenue numeric(12,2)  -- Revenue in NOK, excluding VAT" in text  # column + comment
     assert "agent_runs" not in text       # not readable by the agent -> not shown
 
@@ -60,6 +78,7 @@ def test_system_prompt_survives_db_failure(monkeypatch):
         raise ConnectionError("db down")
     monkeypatch.setattr(service, "describe_schema", boom)
     monkeypatch.setattr(service, "describe_documents", boom)
+    monkeypatch.setattr(service, "business_context", lambda: "")
     assert service.build_system_prompt("Be brief.") == "Be brief."
 
 
@@ -96,8 +115,12 @@ def test_review_snapshot_latest_wins_and_history_is_kept():
         latest = reviews.latest_reviews(run)
         assert latest[1]["decision"] == "accepted" and latest[1]["comment"] == "checked again"
         assert latest[2]["decision"] == "rejected"
+        tool_src = {"claim": "Order 40 units", "tool": "recommend_orders", "arguments": {"sku": "SKU009"}}
+        tool_review = reviews.add_review(run, 3, tool_src, "accepted")
+        assert (tool_review["source_kind"], tool_review["tool_name"], tool_review["tool_arguments"]) == \
+            ("tool", "recommend_orders", {"sku": "SKU009"})
         with db.connect() as conn:
-            assert conn.execute("select count(*) n from claim_reviews where run_id = %s", (run,)).fetchone()["n"] == 3
+            assert conn.execute("select count(*) n from claim_reviews where run_id = %s", (run,)).fetchone()["n"] == 4
     finally:
         with db.connect() as conn:
             conn.execute("delete from agent_runs where id = %s", (run,))   # reviews go with it (cascade)

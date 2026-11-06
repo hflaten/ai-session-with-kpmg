@@ -229,3 +229,30 @@ def test_unmarked_fact_is_sent_back_then_fixed(monkeypatch):
     r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
     assert "The target is 45%." in seen[2]["content"] and "has no marker" in seen[2]["content"]
     assert r.answer["answer"].startswith("The target is 45% [1].")
+
+
+# ---------- tool sources (deterministic calculations) ----------
+
+TOOL_SOURCE = {"claim": "Order 40 units of salmon", "tool": "recommend_orders", "arguments": {"sku": "SKU009"}}
+
+
+def test_tool_source_must_match_a_call_with_the_same_arguments():
+    e = Evidence()
+    e.add("recommend_orders", {"sku": "SKU009", "location_id": None}, {"rows": []})
+    assert citation_errors([TOOL_SOURCE], e) == []
+    wrong = {**TOOL_SOURCE, "arguments": {"sku": "SKU001"}}
+    assert "was not called successfully" in citation_errors([wrong], e)[0]
+    assert "was not called successfully" in citation_errors([TOOL_SOURCE], Evidence())[0]
+
+
+def test_tool_source_passes_the_schema():
+    from app.agent.structured import validation_errors
+    schema = with_sources({"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]})
+    assert validation_errors(schema, {"answer": "x [1]", "sources": [TOOL_SOURCE]}) == []
+
+
+def test_specialist_tool_calls_are_evidence_for_the_orchestrator():
+    e = Evidence()
+    e.add("ask_data_analyst", {"question": "q"}, {"answer": "a", "chunks_found": [], "sql_run": [],
+                                                   "tools_run": [{"tool": "recommend_orders", "arguments": {"sku": "SKU009"}}]})
+    assert citation_errors([TOOL_SOURCE], e) == []

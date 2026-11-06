@@ -17,3 +17,6 @@ supabase/.branches/
 .DS_Store
 .vscode/
 .idea/
+
+# Case data (synthetic, large; loaded into Supabase with scripts/load_hoyden.py)
+data/

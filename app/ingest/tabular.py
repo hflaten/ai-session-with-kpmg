@@ -20,7 +20,7 @@ from app import db
 from app.config import settings
 from app.ingest.table_layout import clean_sheet
 
-RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports", "claim_reviews"}  # never overwrite the backend's own tables
+RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports", "claim_reviews", "proposed_orders"}  # never overwrite the backend's own tables
 MAX_IDENTIFIER = 63                                   # Postgres name length limit
 
 
@@ -62,6 +62,24 @@ def _parse_dates(series: pd.Series) -> pd.Series:
         return pd.to_datetime(series, format="mixed")
     except (ValueError, TypeError):
         return series
+
+
+def _tidy_types(series: pd.Series) -> pd.Series:
+    """"True"/"False" text -> booleans; whole numbers -> integers (77, not 77.0);
+    timestamps that are all midnight -> dates (Postgres `date`, not `timestamp`)."""
+    values = series.dropna()
+    if values.empty:
+        return series
+    if pd.api.types.is_datetime64_any_dtype(series):
+        if (values == values.dt.normalize()).all():
+            return series.map(lambda v: None if pd.isna(v) else v.date())
+        return series
+    is_text = pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)
+    if is_text and values.astype(str).str.lower().isin(["true", "false"]).all():
+        return series.map(lambda v: None if pd.isna(v) else str(v).lower() == "true").astype("boolean")
+    if pd.api.types.is_float_dtype(series) and (values % 1 == 0).all():
+        return series.astype("Int64")
+    return series
 
 
 def _fmt(value) -> str:
@@ -119,7 +137,7 @@ def ingest_table(filename: str, data: bytes, column_descriptions: dict[str, str]
             originals = clean.original_headers           # header text as written in the sheet
             display_names = list(df.columns)
             df.columns = unique_identifiers(display_names)
-            df = df.apply(_parse_dates)
+            df = df.apply(_parse_dates).apply(_tidy_types)
 
             # Column comments: caller's text (matched on original header or new name), else generated
             columns = []
@@ -137,7 +155,9 @@ def ingest_table(filename: str, data: bytes, column_descriptions: dict[str, str]
                         comment += " Non-numeric values left empty: " + ", ".join(f'"{v}"' for v in dropped[:5])
                 columns.append({"name": column, "original_header": str(original), "comment": comment})
 
-            df.to_sql(name, engine, schema="public", if_exists="replace", index=False)
+            # multi-row INSERTs in chunks: much faster than row by row (Postgres allows 65535 parameters)
+            df.to_sql(name, engine, schema="public", if_exists="replace", index=False,
+                      method="multi", chunksize=max(1, 60000 // max(1, len(df.columns))))
 
             table_comment = (f'Uploaded from "{filename}"' + (f', sheet "{sheet}"' if sheet else "")
                              + f" on {date.today().isoformat()}. {len(df)} rows."

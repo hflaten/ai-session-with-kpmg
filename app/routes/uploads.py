@@ -9,6 +9,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.ingest.pdf import ingest_pdf
 from app.ingest.tabular import ingest_table
+from app.tools.inventory import clear_cache
 
 router = APIRouter(prefix="/upload")
 
@@ -37,9 +38,11 @@ async def upload_table(file: UploadFile = File(...), column_descriptions: str | 
             raise HTTPException(400, "column_descriptions must be a JSON object")
     data = await _read(file)
     try:
-        return ingest_table(file.filename or "upload.csv", data, descriptions)
+        result = ingest_table(file.filename or "upload.csv", data, descriptions)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    clear_cache()   # the order plan reads uploaded tables
+    return result
 
 
 @router.post("/pdf")

@@ -5,15 +5,17 @@ in a form" to finish. This works the same on Anthropic and OpenAI-compatible
 APIs, unlike each provider's own JSON mode.
 
 Every structured answer also gets a required `sources` list. Each entry is
-either a document citation or a database citation:
+a document, database or tool citation:
 
     {"claim": "...", "document_name": "report.pdf", "page_number": 2, "chunk_id": "report.pdf:p2:c1"}
-    {"claim": "...", "table": "sample_sales", "sql": "select ..."}
+    {"claim": "...", "table": "sales_daily", "sql": "select ..."}
+    {"claim": "...", "tool": "recommend_orders", "arguments": {"location_id": "L01"}}
 
 Citations are checked against what actually happened in this run (Evidence):
 a chunk_id must have been returned by search_documents (with matching document
 and page), and the sql must be a query_database call that succeeded, with the
-table appearing in it.
+table appearing in it; a tool citation must match a successful call of a citable
+tool (CITABLE_TOOLS: deterministic calculations) with the same arguments.
 
 The answer text must also cite inline: "Oslo met the target [1], Bergen missed it [2]."
 [n] is the 1-based position in `sources`. Every marker must point to a source, every
@@ -26,6 +28,7 @@ carry a marker (unmarked_fact_errors).
 Invalid answers go back to the model to fix.
 """
 import copy
+import json
 import re
 
 from jsonschema import Draft202012Validator
@@ -56,6 +59,17 @@ SOURCES_SCHEMA = {
                     "chunk_id": {"type": "string"},
                 },
                 "required": ["claim", "document_name", "page_number", "chunk_id"],
+                "additionalProperties": False,
+            },
+            {
+                "title": "tool source",
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "tool": {"type": "string", "description": "A calculation tool you called, e.g. recommend_orders"},
+                    "arguments": {"type": "object", "description": "The exact arguments you called it with ({} if none)"},
+                },
+                "required": ["claim", "tool", "arguments"],
                 "additionalProperties": False,
             },
             {
@@ -96,8 +110,9 @@ def make_submit_tool(schema: dict) -> Tool:
         name=SUBMIT_TOOL_NAME,
         description=("Submit your final answer. Call this exactly once, when you are done, with arguments "
                      "that match the schema. Do not answer in plain text. In `sources`, cite every factual "
-                     "claim: chunks you got from search_documents (chunk_id, document_name, page_number) "
-                     "and/or the exact SQL you ran with query_database (table, sql). In the answer text, "
+                     "claim: chunks you got from search_documents (chunk_id, document_name, page_number), "
+                     "the exact SQL you ran with query_database (table, sql), and/or a calculation tool you "
+                     "called such as recommend_orders (tool, arguments: exactly as you called it). In the answer text, "
                      "mark each claim inline with [n] = its 1-based position in `sources`, right after the "
                      "claim, e.g. \"Oslo met the target [1], Bergen missed it [2].\" Every source must be marked, "
                      "and each marker exactly once: one marker per claim. If two claims rest on the same evidence, "
@@ -119,6 +134,14 @@ def validation_errors(schema: dict, answer: dict) -> list[str]:
 
 # ---------- citation checking ----------
 
+CITABLE_TOOLS = {"recommend_orders"}   # deterministic tools whose results can back a claim
+
+
+def normalize_args(args: dict) -> str:
+    """Compare tool arguments ignoring key order and empty (null) values."""
+    return json.dumps({k: v for k, v in (args or {}).items() if v is not None and v != ""}, sort_keys=True)
+
+
 def normalize_sql(sql: str) -> str:
     """Compare queries ignoring whitespace, case and a trailing semicolon."""
     return re.sub(r"\s+", " ", sql).strip().rstrip(";").strip().lower()
@@ -134,6 +157,7 @@ class Evidence:
     def __init__(self) -> None:
         self.chunks: dict[str, dict] = {}   # chunk_id -> {document_name, page_number}
         self.sql: dict[str, str] = {}       # normalized SQL -> SQL as written, for successful queries
+        self.tools: dict[tuple[str, str], dict] = {}   # (tool, normalized args) -> args, for citable tools
 
     def add(self, tool_name: str, args: dict, output) -> None:
         if tool_name == "search_documents":
@@ -141,17 +165,24 @@ class Evidence:
                 self.chunks[r["chunk_id"]] = {"document_name": r["document_name"], "page_number": r["page_number"]}
         elif tool_name == "query_database":
             self.sql[normalize_sql(args["sql"])] = args["sql"]
+        elif tool_name in CITABLE_TOOLS:
+            self.tools[(tool_name, normalize_args(args))] = args
         elif isinstance(output, dict) and "chunks_found" in output:  # a specialist's report
             for c in output["chunks_found"]:
                 self.chunks[c["chunk_id"]] = {"document_name": c["document_name"], "page_number": c["page_number"]}
             for sql in output["sql_run"]:
                 self.sql[normalize_sql(sql)] = sql
+            for t in output.get("tools_run", []):
+                self.tools[(t["tool"], normalize_args(t["arguments"]))] = t["arguments"]
 
     def chunk_list(self) -> list[dict]:
         return [{"chunk_id": cid, **ref} for cid, ref in self.chunks.items()]
 
     def sql_list(self) -> list[str]:
         return list(self.sql.values())
+
+    def tool_list(self) -> list[dict]:
+        return [{"tool": name, "arguments": args} for (name, _), args in self.tools.items()]
 
 
 def _table_in_sql(table: str, sql: str) -> bool:
@@ -170,6 +201,10 @@ def citation_errors(sources: list[dict], evidence: Evidence) -> list[str]:
             elif (seen["document_name"], seen["page_number"]) != (s["document_name"], s["page_number"]):
                 errors.append(f"{where}: chunk '{s['chunk_id']}' is from {seen['document_name']} "
                               f"page {seen['page_number']}, not {s['document_name']} page {s['page_number']}")
+        elif "tool" in s:
+            if (s["tool"], normalize_args(s["arguments"])) not in evidence.tools:
+                errors.append(f"{where}: {s['tool']} was not called successfully with arguments "
+                              f"{normalize_args(s['arguments'])} in this run; copy the exact arguments you used")
         elif "sql" in s:
             if normalize_sql(s["sql"]) not in evidence.sql:
                 errors.append(f"{where}: this sql was not run successfully with query_database in this run; "

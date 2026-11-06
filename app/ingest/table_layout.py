@@ -32,6 +32,7 @@ import pandas as pd
 HEADER_SEARCH_ROWS = 15
 TOTAL_LABEL = re.compile(r"^(grand\s+)?(sub)?totals?\b|^sum\b", re.IGNORECASE)
 UNIT_ONLY = re.compile(r"^\(?\d[\d .,]*\s*[A-Za-z/%³]+\)?$|^%$")   # "1000 boed", "(NOK m)", "%"
+THOUSANDS = re.compile(r"^-?\d{1,3}(,\d{3})+(\.\d+)?%?$")   # "1,234" or "12,345.6"
 EMPTY_MARKERS = {"-", "–", "—", "n/a", "na", "n.a.", ""}
 
 
@@ -53,13 +54,17 @@ def _is_empty(v) -> bool:
 
 
 def to_number(v):
-    """Number or None. Accepts 12, "12.5", "1,234", "45.9%" (-> 0.459)."""
+    """Number or None. Accepts 12, "12.5", "1,234", "45.9%" (-> 0.459). "0,2,4" is a list, not a number."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
         return None if isinstance(v, float) and math.isnan(v) else v
     if isinstance(v, str):
-        s = v.strip().replace(",", "").replace(" ", "").replace(" ", "")
+        s = v.strip().replace(" ", "").replace(" ", "")
+        if "," in s:
+            if not THOUSANDS.match(s):   # "0,2,4" is a list, not 24
+                return None
+            s = s.replace(",", "")
         pct = s.endswith("%")
         try:
             n = float(s[:-1] if pct else s)

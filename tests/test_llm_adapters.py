@@ -68,6 +68,30 @@ def test_anthropic_call_roundtrip(monkeypatch):
     assert (r.input_tokens, r.output_tokens) == (11, 7)
 
 
+def test_anthropic_retries_without_forced_tool_when_model_refuses(monkeypatch):
+    import anthropic
+    import httpx
+    resp = Message.model_validate({
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "m", "stop_reason": "tool_use",
+        "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1},
+        "content": [{"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Oslo"}}]})
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if "tool_choice" in kwargs:
+            raise anthropic.BadRequestError(
+                'tool_choice: type "tool" and "any" are not supported for this model.',
+                response=httpx.Response(400, request=httpx.Request("POST", "https://x")), body=None)
+        return resp
+    monkeypatch.setattr(anthropic_adapter, "_get_client",
+                        lambda: SimpleNamespace(messages=SimpleNamespace(create=create)))
+
+    r = anthropic_adapter.call("sys", CONVERSATION[:1], [WEATHER], force_tool="get_weather")
+    assert len(calls) == 2 and "tool_choice" not in calls[1]
+    assert r.tool_calls[0].name == "get_weather"
+
+
 # ---------- OpenAI-compatible ----------
 
 def test_openai_messages_shape():

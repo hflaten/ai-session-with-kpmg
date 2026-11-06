@@ -21,27 +21,38 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 | LLM adapters | `app/llm/` | One `call_llm()`; tools defined once (name, description, input schema); adapters translate to Anthropic / OpenAI format. `LLM_PROVIDER` picks one. |
 | Agent loop | `app/agent/loop.py` | `run_agent(system_prompt, tools, task)`: call LLM → run tools → repeat, max 10 steps. Returns answer + trace. |
 | Run service | `app/agent/service.py` | `execute()`: logs the run, builds prompt + tools, wires approvals. Used by `/agent/run` and `/agent/stream`. |
-| Tools | `app/tools/` | `query_database` (read-only SQL), `search_documents` (pgvector). |
+| Tools | `app/tools/` | `query_database` (read-only SQL), `search_documents` (pgvector), `recommend_orders` (deterministic order plan), `save_report` + `create_purchase_order` (need approval). |
+| Order planner | `app/inventory/` | **No LLM**, pandas + plain Python (`planner.py` = the maths, `data.py` = loads the case tables as `agent_readonly`). Per sku × location: demand history with lost sales added back on stockout days (in-stock days ±10 days × weekday index); forecast = same day last year (−364 d) × trend (last 8 weeks / same 8 weeks last year, clipped 0.5–2.5), last year's promotion days ÷ uplift, planned promotions × uplift; stores closed Sundays + Norwegian holidays. Day-by-day FIFO stock simulation (deliveries, expiry → waste, unmet demand → lost sales) in three scenarios: no new orders (days of cover, stockout risk date, waste from current batches), **without** = business as usual (open orders + the same orders as the same weeks last year), **with** = recommended orders (on supplier order weekdays, not holidays: units short until the next possible delivery + safety stock z=1.65, capped at what sells within shelf life, whole packs). Overstock = > 6 weeks of cover; releasable = stock above 6 weeks. `nok_impact` = lost sales avoided + waste avoided + releasable capital. "Today" = day after the last `sales_daily` date. Cached 5 min (`app/tools/inventory.py`), cleared on upload. |
+| Business context | `app/business_context.md` | Case background added to every system prompt (HTML comments stripped). Now: Høyden README without the "fasit" section. Replace/empty it for a new case. |
 | Structured output | `app/agent/structured.py` | Final answer is a `submit_answer` tool call whose schema is the requested JSON schema + a required `sources` list. Citations are checked against what the agent actually found this run. Works on both providers. |
 | Streaming | `app/routes/` | SSE, one event per agent step. Every run logged to `agent_runs`. |
 | Ingest | `app/ingest/` | CSV/Excel → own table via pandas, with table + column comments; PDF → per-page chunks → embeddings → `document_chunks`. Report-style sheets are cleaned first by `table_layout.clean_sheet()`: finds the real header row (top 15 rows), combines two-row headers (group label fills right), drops empty rows/columns, skips rows labelled Total/Sum, moves footnotes to the table comment, turns stacked or side-by-side tables into a `section` column, converts mostly-numeric columns ("45.9%" → 0.459, "-" → empty). |
-| Human-in-the-loop | `app/agent/approvals.py` | Tools flagged `requires_approval` (only `save_report`) pause the run until `/runs/{id}/approve` or `/reject` (10 min timeout = rejected). The request is registered *before* it is announced, so an instant click is never lost. Held in memory → single worker. |
+| Human-in-the-loop | `app/agent/approvals.py` | Tools flagged `requires_approval` (`save_report`, `create_purchase_order`) pause the run until `/runs/{id}/approve` or `/reject` (10 min timeout = rejected). The request is registered *before* it is announced, so an instant click is never lost. Held in memory → single worker. |
 | Orchestrator | `app/agent/orchestrator.py` | `mode: "orchestrator"`. Specialists run in parallel (the loop runs several plain tool calls from one response in threads, recording them in call order; trace entries have `parallel: true`). No direct data access: its tools `ask_data_analyst` / `ask_document_researcher` each run `run_agent` for a specialist (own prompt, own tool, only its own context). The delegation entry nests the specialist's trace (`child_trace`); `agent_runs.parent_run_id` links the runs; `GET /runs/{id}/tree` rebuilds the tree. Specialists return `chunks_found` + `sql_run`, so the orchestrator's citations are checked too. |
 
 ### Database (supabase/migrations)
 
 - `agent_runs`: id, created_at, parent_run_id, agent_name, task, provider, model,
   status (running | awaiting_approval | completed | failed), answer, trace, error, duration_ms.
-- `sample_sales`: 24 rows of made-up demo data for testing query_database (drop before real use).
+- `sample_sales`: 24 rows of made-up demo data (dropped by the 2026-11-06 reset; the live DB tests now create their own `zz_test_sales`).
 - `saved_reports`: id, created_at, run_id, title, content. Written only by `save_report` after a human
   approves. RLS on, with a read policy for `agent_readonly`. Kept by the reset script.
 - `claim_reviews`: id, created_at, run_id (cascade), source_index (0-based) + generated `marker` (1-based), decision
   (accepted | rejected), reviewer, comment, plus a **snapshot** of the claim: claim, source_kind, document_name,
   page_number, chunk_id, table_name, sql_query. Newest row per claim is the current decision. Backend only; emptied by the reset script.
+- `proposed_orders`: id, created_at, run_id (set null), sku, location_id, qty (> 0), order_date, reason,
+  status (approved | rejected), source (agent | dashboard), decided_by. Written by `create_purchase_order`
+  after approval, or by `POST /orders` from the dashboard. RLS on, read policy for `agent_readonly`. Emptied by the reset script.
 - `document_chunks`: chunk_id (`file:p<page>:c<index>`), document_name, page_number, chunk_index,
   text, embedding `vector(1536)` with an HNSW cosine index. Not readable by `agent_readonly`;
   `search_documents` reads it with a fixed query. Re-uploading a file name replaces its chunks.
 - Uploaded tables: one per CSV / Excel sheet, named after the file (snake_case). Re-upload replaces.
+  Types are tidied: "True"/"False" → boolean, whole numbers → bigint, all-midnight timestamps → date;
+  "0,2,4" stays text (only `1,234`-style commas are thousands separators).
+- Case data (Høyden Matmarked, KPMG case 4): `data/hoyden/*.csv` (gitignored), loaded with
+  `.venv/bin/python -m scripts.load_hoyden <BACKEND_URL>` through `/upload/table`, with column descriptions
+  written from its README. Tables: locations, suppliers, products, calendar, promotions, sales_daily,
+  sales_weekly, inventory_weekly, inventory_current, inventory_batches_current, purchase_orders, waste.
 - `agent_readonly` role: `SELECT` on `public` (including future tables, e.g. uploads),
   `default_transaction_read_only = on`, `statement_timeout = 10s`, no access to `agent_runs`.
   Its password is not in the migration; set it with `scripts/set_readonly_password.py`.
@@ -59,6 +70,9 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
   and `chunk_id` for every claim.
 - **Uploaded tables get comments:** when loading a CSV/Excel file, add a Postgres comment on
   the table and on **every column** describing it, so the agent sees them in its prompt.
+- **Tool claims** (inventory case): `{claim, tool, arguments}` for deterministic tools in `CITABLE_TOOLS`
+  (`recommend_orders`); must match a successful call with the same arguments (nulls ignored). `/sources`
+  re-runs the tool and returns `result`; reviews snapshot `tool_name` + `tool_arguments`.
 - **Database claims are cited too** (user's decision): `{claim, table, sql}`. The sql must be a
   query that ran successfully with query_database in this run, and the table must appear in it.
 - **Column comments on upload:** a generated summary (original header, counts, range, examples),
@@ -129,6 +143,10 @@ comments show up immediately. The list of uploaded documents (`describe_document
 | POST | `/runs/{run_id}/claims/{marker}/review` | `{decision: accepted \| rejected, reviewer?, comment?}` | `{run_id, marker, review}`; marker = the `[n]` in the text (1-based); 404 bad run/marker |
 | POST | `/upload/table` | multipart: `file` (.csv/.xlsx), `column_descriptions?` (JSON string) | `{tables: [{table, rows, comment, columns}], unused_column_descriptions}` |
 | POST | `/upload/pdf` | multipart: `file` (.pdf, max 20 MB) | `{document_name, pages, chunks}` |
+| GET | `/insights/summary` | `?horizon_days=56` | 4 KPIs `{value, definition, inputs}`: stock value, waste last 90 days, stockout rate (fraction), capital in overstock; + `plan_totals` with vs without |
+| GET | `/insights/recommendations` | `?limit=30&location_id&sku&horizon_days` | top rows by `nok_impact` (each with `inputs` = the why, and latest `decision`) + `overstock` list |
+| POST | `/orders` | `{sku, location_id, qty, order_date, decision, reason?, decided_by?}` | `{order}` (dashboard approve/reject → `proposed_orders`) |
+| GET | `/orders` | `?limit=100` | `{orders}` newest first |
 
 SSE events, in order: `run_started` `{run_id}` → one `step` per trace entry
 (`type`: `llm` | `tool` | `approval` | `final_answer`) → `done` `{run_id, answer, stopped_reason, trace}`,
@@ -144,6 +162,9 @@ orchestrator's `tool` entry for the delegation (with `child_trace`).
 `answer` is a string, or an object matching `output_schema` when one is given
 (it must have `"type": "object"` at the top level and must not define `sources` itself —
 `sources` is always added).
+
+**Anthropic note:** `claude-sonnet-5-5` rejects a forced `tool_choice`; the adapter retries without it
+(the loop has already asked for `submit_answer` in the conversation). `max_tokens` is 16000.
 
 **OpenAI note:** `OPENAI_REASONING_EFFORT` is only sent when set. `gpt-6.1-terra` needs `none`
 for tool calls on Chat Completions.
@@ -191,7 +212,8 @@ backend, printing a timeline. Note: `approve` saves a real row in `saved_reports
 ```bash
 .venv/bin/python -m scripts.reset_data          # dry run: lists what would be deleted
 .venv/bin/python -m scripts.reset_data --yes    # drops all uploaded/demo tables (incl. sample_sales),
-                                                # empties document_chunks + saved_reports; keeps agent_runs
+                                                # empties document_chunks, saved_reports, claim_reviews,
+                                                # proposed_orders; keeps agent_runs
 .venv/bin/python -m scripts.reset_data --include-runs --yes   # same, and also empties agent_runs
 ```
 
@@ -235,3 +257,4 @@ the first request after a sleep takes ~30–60 s, and any run waiting for approv
 - [x] 4 query_database           - [x] 5 Structured output - [x] 6 SSE + run logging
 - [x] 7 Uploads + RAG - [x] 8 Human-in-the-loop
 - [x] 9 Orchestrator             - [x] 10 Deploy
+- [x] Case 4 (Høyden, 2026-11-06): reset, data loaded, recommend_orders, create_purchase_order, dashboard endpoints

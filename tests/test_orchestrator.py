@@ -109,7 +109,7 @@ def test_orchestrator_cannot_cite_what_specialists_did_not_find(monkeypatch, set
 
 def test_orchestrator_has_no_direct_data_tools():
     names = [t.name for t in service.tools_for_run("run-1", "orchestrator")]
-    assert names == ["ask_data_analyst", "ask_document_researcher", "save_report"]
+    assert names == ["ask_data_analyst", "ask_document_researcher", "save_report", "create_purchase_order"]
 
 
 def test_specialists_only_see_their_own_context(monkeypatch):

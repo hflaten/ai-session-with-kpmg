@@ -53,11 +53,17 @@ def call(system: str, messages: list[dict], tools: list[Tool], force_tool: str |
         kwargs["tools"] = to_anthropic_tools(tools)
     if force_tool:
         kwargs["tool_choice"] = {"type": "tool", "name": force_tool}
-    resp = _get_client().messages.create(
-        model=settings.anthropic_model,
-        max_tokens=4096,
-        system=system,
-        messages=to_anthropic_messages(messages),
-        **kwargs,
-    )
+
+    def create(**extra):
+        return _get_client().messages.create(model=settings.anthropic_model, max_tokens=16000, system=system,
+                                             messages=to_anthropic_messages(messages), **extra)
+    try:
+        resp = create(**kwargs)
+    except anthropic.BadRequestError as e:
+        # Some models don't support forcing a tool. The loop has already asked for it in
+        # the conversation, so retry with the model choosing (it will call the tool).
+        if "tool_choice" not in kwargs or "tool_choice" not in str(e):
+            raise
+        kwargs.pop("tool_choice")
+        resp = create(**kwargs)
     return from_anthropic_response(resp)

@@ -144,3 +144,20 @@ def test_fraction_comment_on_upload(monkeypatch):
     assert margin["original_header"] == "Margin / %"
     assert "Fraction, not percent: 0.51 = 51%." in margin["comment"]
     assert 'Non-numeric values left empty: "Varies"' in margin["comment"]
+
+
+def test_comma_lists_are_not_thousands():
+    from app.ingest.table_layout import to_number
+    assert to_number("0,2,4") is None and to_number("1,4") is None
+    assert to_number("1,234") == 1234 and to_number("12,345.5") == 12345.5
+
+
+def test_types_are_tidied_booleans_integers_dates():
+    import datetime
+    import pandas as pd
+    from app.ingest.tabular import _parse_dates, _tidy_types
+    tidy = lambda values: _tidy_types(_parse_dates(pd.Series(values))).tolist()
+    assert tidy(["True", "False", None])[:2] == [True, False]
+    assert tidy([1.0, 2.0]) == [1, 2]
+    assert tidy([1.5, 2.0]) == [1.5, 2.0]
+    assert tidy(["2026-01-01", "2026-02-03"]) == [datetime.date(2026, 1, 1), datetime.date(2026, 2, 3)]

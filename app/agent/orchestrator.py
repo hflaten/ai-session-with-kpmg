@@ -18,6 +18,7 @@ from app import runs
 from app.agent.loop import run_agent
 from app.llm import Tool
 from app.tools.database import query_database_tool
+from app.tools.inventory import recommend_orders_tool
 from app.tools.documents import search_documents_tool
 
 ORCHESTRATOR_PROMPT = (
@@ -25,8 +26,8 @@ ORCHESTRATOR_PROMPT = (
     "- ask_data_analyst: questions about numbers in the database tables.\n"
     "- ask_document_researcher: questions about what the uploaded documents say.\n"
     "Split the user's task into focused questions, delegate them (both at once when they are "
-    "independent), then combine the answers. Each specialist reports `chunks_found` and `sql_run`: "
-    "cite those exact chunk_ids and SQL in your sources. Never invent numbers or citations."
+    "independent), then combine the answers. Each specialist reports `chunks_found`, `sql_run` and `tools_run`: "
+    "cite those exact chunk_ids, SQL and tool calls (tool + arguments) in your sources. Never invent numbers or citations."
 )
 
 
@@ -43,10 +44,12 @@ class Specialist:
 SPECIALISTS = [
     Specialist(
         name="data_analyst",
-        description="Answers questions about numbers in the database tables, using SQL.",
-        system_prompt=("You are a data analyst. Answer the question with query_database. Give exact numbers, "
+        description=("Answers questions about numbers in the database tables, using SQL, and order plans "
+                     "(what to order, stockouts, waste, overstock) using recommend_orders."),
+        system_prompt=("You are a data analyst. Answer the question with query_database, and with recommend_orders "
+                       "for order plans, stockout risk, waste risk and overstock. Give exact numbers, "
                        "say how you calculated them, and keep it short."),
-        tools=[query_database_tool],
+        tools=[query_database_tool, recommend_orders_tool],
         sees_tables=True,
     ),
     Specialist(
@@ -90,12 +93,13 @@ def make_delegation_tools(parent_run_id: str, emit: Callable[[dict], None],
 
             # What the orchestrator sees: the answer plus the evidence it may cite
             return {"specialist": spec.name, "run_id": child_run_id, "answer": result.answer,
-                    "chunks_found": result.evidence.chunk_list(), "sql_run": result.evidence.sql_list()}
+                    "chunks_found": result.evidence.chunk_list(), "sql_run": result.evidence.sql_list(),
+                    "tools_run": result.evidence.tool_list()}
 
         return Tool(
             name=f"ask_{spec.name}",
             description=spec.description + " Ask one focused question; you get back its answer, "
-                                           "chunks_found and sql_run.",
+                                           "chunks_found, sql_run and tools_run.",
             input_schema={"type": "object",
                           "properties": {"question": {"type": "string", "description": "A self-contained question"}},
                           "required": ["question"]},

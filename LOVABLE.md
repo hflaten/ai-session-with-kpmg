@@ -47,6 +47,10 @@ Placeholders used below — replace them in the Lovable project, never commit re
 | POST | `/runs/{run_id}/reject` | `{reason?: string}` | `{run_id, decision: "rejected"}` |
 | POST | `/upload/table` | multipart: `file` (.csv/.xlsx/.xls), `column_descriptions?` (JSON string) | `{tables: [{table, rows, comment, columns}], unused_column_descriptions}` |
 | POST | `/upload/pdf` | multipart: `file` (.pdf) | `{document_name, pages, chunks}` |
+| GET | `/insights/summary` | `?horizon_days=56` | KPI cards for the inventory dashboard (section 9) |
+| GET | `/insights/recommendations` | `?limit=30&location_id=&sku=&horizon_days=56` | `{today, horizon_days, recommendations, overstock}` (section 9) |
+| POST | `/orders` | `{sku, location_id, qty, order_date, decision: "approved" \| "rejected", reason?, decided_by?}` | `{order}` — a human decision on a recommended order |
+| GET | `/orders` | `?limit=100` | `{orders: [...]}` newest first |
 
 **`RunRequest`**
 
@@ -157,13 +161,16 @@ With an `output_schema`, `answer` looks like this (your fields + `sources`):
 }
 ```
 
-Two kinds of source — tell them apart by which key exists:
+Three kinds of source — tell them apart by which key exists:
 
 - **Document**: has `chunk_id` → `{claim, document_name, page_number, chunk_id}`
 - **Database**: has `sql` → `{claim, table, sql}`
+- **Tool**: has `tool` → `{claim, tool, arguments}` — a deterministic calculation, e.g.
+  `{"tool": "recommend_orders", "arguments": {"location_id": "L01"}}`
 
 The backend has already checked that every cited chunk was really found by a search in this
-run (same document and page), and every SQL really ran. One claim can have several entries.
+run (same document and page), every SQL really ran, and every tool really ran with those
+arguments. One claim can have several entries.
 
 ### Inline markers `[n]` — one marker = one claim
 
@@ -249,12 +256,15 @@ the inline `marker` (`index + 1`) and the latest human `review` (section 8):
 
 - `document` → show `text` (the original page text) with "document_name — page N".
 - `database` → show `rows` as a table with `columns` as headers, plus the `sql` (collapsible).
+- `tool` → show "Calculated by {tool}" with the `arguments`, and `result` (the tool's output,
+  re-run now) as collapsible JSON; for `recommend_orders`, `result.rows` is a table-friendly list.
 - `error` is non-null if the evidence is gone (e.g. data was reset) — show it instead.
 
 ## 6. Human-in-the-loop: approve / reject
 
-Only one tool needs approval today: **`save_report`** (`input: {title, content}`), used when the
-user asks to save/store/share something.
+Two tools need approval: **`save_report`** (`input: {title, content}`), used when the user asks to
+save/store/share something, and **`create_purchase_order`** (`input: {sku, location_id, qty,
+order_date, reason}`), used when the user asks the agent to place orders.
 
 1. The stream sends `approval_required` with `run_id`, `tool` and `input`, then **pauses**.
 2. Show the tool and its input (title + content) with **Approve** and **Reject** buttons and an
@@ -304,19 +314,87 @@ await fetch(`${BACKEND_URL}/runs/${runId}/claims/${marker}/review`, {   // marke
   body: JSON.stringify({ decision: "accepted", reviewer: "Ana", comment: "matches page 1" }),
 });
 // -> { run_id, marker, review: { id, created_at, marker, decision, reviewer, comment,
-//      claim, source_kind, document_name, page_number, chunk_id, table_name, sql_query } }
+//      claim, source_kind, document_name, page_number, chunk_id, table_name, sql_query,
+//      tool_name, tool_arguments } }
 ```
 
 - **One numbering:** the URL takes the marker number, 1-based, exactly as written in the text.
   `[3]` → `/claims/3/review`. (`index` in `/sources` is only the 0-based list position.)
 - `decision`: `"accepted"` or `"rejected"`; `reviewer` and `comment` are optional.
 - Each review stores a **snapshot** of the claim text and its reference (document + page + chunk,
-  or table + SQL), so the audit record stands on its own even if the run changes later.
+  table + SQL, or tool + arguments), so the audit record stands on its own even if the run changes later.
 - Reviewing again adds a new review; the newest is the current decision (`/sources` returns it as
   `review`). History is kept in the database.
 - `GET /runs/{run_id}/sources` → `summary: {total, accepted, rejected, unreviewed}`; `total` is the
   number of claims. Progress bar: "{accepted} of {total} claims verified".
 - 404 = unknown run, or marker out of range (markers start at 1). 422 = bad `decision`.
+
+## 9. Inventory dashboard (Høyden case)
+
+No LLM here: plain SQL plus a deterministic order planner (Python). Results are cached for
+5 minutes (cleared on upload). The first call after the backend wakes up takes a few seconds.
+
+**`GET /insights/summary`** → four KPI cards, each `{value, definition, inputs}`:
+
+| Key | Value |
+|---|---|
+| `total_stock_value_nok` | stock on hand now at purchase price |
+| `waste_last_90_days_nok` | written-off stock at purchase price, last 90 days |
+| `stockout_rate_last_90_days` | **fraction** (0.0357 = 3.6 %) of product-days that sold out |
+| `capital_in_overstock_nok` | stock value of items with > 6 weeks of cover; `inputs.capital_releasable_nok` = the part above 6 weeks |
+
+Plus `plan_totals: {horizon_days, with_recommendation, without_recommendation, overstock_items,
+capital_releasable_nok}`, where both scenarios are `{capital_tied_nok, lost_sales_nok, waste_nok}`
+over the horizon (8 weeks by default).
+
+**`GET /insights/recommendations`** → `{today, horizon_days, recommendations: [...], overstock: [...]}`.
+`recommendations` = top 30 sku × location rows by `nok_impact`; `overstock` = every row with
+`overstock: true`, by `capital_releasable_nok`. Each row:
+
+```json
+{
+  "sku": "SKU009", "product_name": "Røkt laks 300 g", "category": "Fisk og sjømat",
+  "location_id": "L04", "location_name": "Høyden Nettbutikk", "supplier_name": "Nordfjord Sjømat",
+  "action": "order",                      // order | reduce (overstock) | ok
+  "days_of_cover": 0.0,                   // on hand / forecast daily demand; null = no expected demand
+  "stockout_risk_date": "2026-11-11",     // with current stock + open orders only; null = none
+  "expected_waste_units": 0.0, "expected_waste_nok": 0,
+  "next_order": {"order_date": "2026-11-06", "arrival_date": "2026-11-08", "qty": 40},
+  "recommended_orders": [{"order_date": "...", "arrival_date": "...", "qty": 10}],
+  "with_recommendation":    {"capital_tied_nok": 5342, "lost_sales_nok": 0,     "waste_nok": 0, "lost_units": 0, "waste_units": 0},
+  "without_recommendation": {"capital_tied_nok": 1713, "lost_sales_nok": 49235, "waste_nok": 0, "lost_units": 330.4, "waste_units": 0},
+  "overstock": false, "capital_releasable_nok": 0,
+  "nok_impact": 49235,                    // lost sales avoided + waste avoided + capital releasable
+  "inputs": {                             // the "why"
+    "on_hand_units": 0, "on_order_units": 70, "open_orders": [...], "batches": [{"expiry_date": "...", "units": 11}],
+    "unit_cost_nok": 74, "price_nok": 149, "shelf_life_days": 14, "pack_size": 10,
+    "lead_time_days_avg": 2, "lead_time_days_sd": 1, "order_weekdays": [0, 2, 4],
+    "trend_factor": 1.091, "last_8_weeks_units": 675, "same_8_weeks_last_year_units": 618,
+    "forecast_daily_avg": 19.92, "forecast_weekly_units": [79.6, 69.8, 87.5, 112.0, 185.4, 233.3, 244.7, 103.5],
+    "stockout_days_in_history": 30, "promo_uplift": 1.34, "planned_promo_days": ["2026-12-01", "..."],
+    "safety_stock_units": 39.8, "business_as_usual_orders": 23, "business_as_usual_units": 760
+  },
+  "decision": null                        // latest POST /orders for this sku + location + next_order.order_date
+}
+```
+
+"Without" = business as usual (open orders + the same orders as the same weeks last year);
+"with" = the recommended orders. `order_weekdays`: 0 = Monday.
+
+**Approve / reject a recommendation** (writes a row in `proposed_orders`):
+
+```ts
+await fetch(`${BACKEND_URL}/orders`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
+  body: JSON.stringify({ sku: row.sku, location_id: row.location_id, qty: row.next_order.qty,
+                         order_date: row.next_order.order_date, decision: "approved",
+                         reason: "Christmas demand", decided_by: "Ana" }),
+});
+// -> { order: { id, created_at, sku, location_id, qty, order_date, reason, status, source: "dashboard", decided_by } }
+```
+
+400 = unknown sku/location; 422 = qty ≤ 0 or bad date/decision.
 
 ---
 
@@ -519,4 +597,73 @@ function splitClaims(text) {
 - Above each assistant answer that has sources, show a thin progress bar and the text
   "{summary.accepted} of {summary.total} claims verified", plus "· {summary.rejected} rejected"
   in red if rejected > 0. Green fill = accepted share, red segment = rejected share.
+````
+
+
+## Ready-to-paste prompt: Dashboard tab (inventory case)
+
+Paste into the existing Lovable project. It reuses the existing config (BACKEND_URL, API key).
+
+````text
+Add a second tab "Dashboard" next to the chat (keep everything that exists; reuse BACKEND_URL,
+API_KEY and the fetch helper from src/config.ts; every request sends header X-API-Key). No Supabase.
+Do not invent endpoints or fields.
+
+DATA
+- GET {BACKEND_URL}/insights/summary -> { today, kpis, plan_totals }
+  kpis has four entries, each { value, definition, inputs }:
+  total_stock_value_nok, waste_last_90_days_nok, stockout_rate_last_90_days (a FRACTION: 0.0357 = 3.6 %),
+  capital_in_overstock_nok (inputs.capital_releasable_nok = the part above 6 weeks of cover).
+  plan_totals = { horizon_days, with_recommendation, without_recommendation, overstock_items,
+  capital_releasable_nok }; both scenarios are { capital_tied_nok, lost_sales_nok, waste_nok }.
+- GET {BACKEND_URL}/insights/recommendations?limit=30 -> { today, horizon_days, recommendations, overstock }
+  Each row: sku, product_name, category, location_id, location_name, supplier_name,
+  action ("order" | "reduce" | "ok"), days_of_cover (number or null), stockout_risk_date (date or null),
+  expected_waste_nok, next_order ({order_date, arrival_date, qty} or null), recommended_orders [...],
+  with_recommendation and without_recommendation ({capital_tied_nok, lost_sales_nok, waste_nok}),
+  overstock (bool), capital_releasable_nok, nok_impact, inputs (object: the numbers behind the
+  recommendation), decision (null or {status: "approved"|"rejected", decided_by, created_at}).
+- POST {BACKEND_URL}/orders with JSON { sku, location_id, qty, order_date, decision: "approved" | "rejected",
+  reason?, decided_by? } -> { order }. 400 = unknown sku/location.
+- The backend may be asleep: the first call can take up to 60 s. Show skeletons, and a "waking up
+  the backend…" note after 5 s. Show errors inline with a Retry button.
+
+LAYOUT
+1. Header: "Inventory — today {today}, plan for the next {horizon_days} days", and a Refresh button.
+2. KPI cards (4): Stock value, Waste last 90 days, Stockout rate (value × 100, one decimal, "%"),
+   Capital in overstock (subtitle "NOK {capital_releasable_nok} could be released"). Format NOK as
+   "NOK 393 306" (space thousands separator, no decimals). Each card has an info icon; its tooltip
+   shows `definition` and the `inputs` as key: value lines.
+3. "With vs without the recommendations" strip from plan_totals: three small comparisons
+   (capital tied up, lost sales, waste): without → with, and the difference in green when lower.
+4. Recommendations table (rows from recommendations): Product (product_name + sku, small),
+   Location, Action badge (order = blue, reduce = amber, ok = grey), Days of cover (1 decimal, "—" if null),
+   Stockout risk (date, red if within 7 days of today), Next order ("{qty} on {order_date}, arrives {arrival_date}"
+   or "—"), Lost sales avoided (without.lost_sales_nok − with.lost_sales_nok), Waste avoided
+   (without.waste_nok − with.waste_nok), NOK impact (bold), and a Decision column:
+   - if next_order is null: "—"
+   - if decision is set: a badge "Approved"/"Rejected" (+ decided_by), with a small "change" link
+   - else: Approve and Reject buttons. Reject opens a small input for an optional reason.
+     Both POST /orders with qty and order_date from next_order, decided_by from a "Your name" input in
+     the tab header (remembered in localStorage). After success, refetch recommendations.
+   Sortable by NOK impact (default), days of cover and stockout risk. Filter chips by location.
+5. Row click expands a "Why" panel: forecast_weekly_units as a small bar chart (week 1..n),
+   trend_factor ("+9.1 % vs last year"), last_8_weeks_units vs same_8_weeks_last_year_units,
+   on_hand_units, on_order_units and open_orders, batches with expiry dates, lead_time_days_avg ± sd,
+   order_weekdays as weekday names (0 = Monday), shelf_life_days, pack_size, safety_stock_units,
+   promo_uplift and planned_promo_days, business_as_usual_orders/units, and every recommended order
+   in recommended_orders. Then the with/without numbers side by side.
+6. Overstock list (rows from overstock), sorted by capital_releasable_nok: Product, Location,
+   Days of cover ("no expected demand" if null), Stock value (inputs.on_hand_units × inputs.unit_cost_nok),
+   Capital releasable (bold). Small note: "More than 6 weeks of cover. Releasable = stock above 6 weeks."
+
+In the chat tab, sources can now also be a third kind with a `tool` key: {claim, tool, arguments}.
+Show it as "Calculated by {tool}" with the arguments; in GET /runs/{id}/sources such a source has
+`kind: "tool"` and `result` (show as collapsible JSON). Approval requests can now also be for the tool
+create_purchase_order (input: sku, location_id, qty, order_date, reason): show these fields in the
+approval card.
+
+Check: the Dashboard shows four KPI cards with numbers, about 30 recommendation rows with smoked
+salmon (Røkt laks) near the top, and an overstock list with balsamico and flaky salt. Approving a row
+turns its buttons into an "Approved" badge that stays after Refresh.
 ````

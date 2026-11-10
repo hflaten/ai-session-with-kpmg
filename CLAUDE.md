@@ -82,6 +82,10 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
     `splitClaims`) matches a cited value (`app/agent/numbers.py`: rounding to the precision shown, k/m, fraction→%,
     factor→% change, the difference of two cited values; digits inside names like "Røkt laks 300 g" and years ignored).
     Soft failures go back to the model; after 2 rejections the answer is accepted with `warnings` (also on the trace entry).
+  - Unmarked numbers (`unmarked_numbers`: sentences with digits but no marker, with exact `start`/`end` positions per
+    text field and per number) are sent back **once**; then accepted with `unverified_numbers` + a warnings line each.
+  - Match types (`numbers.explain`): exact | rounded | percent | factor | date | difference (with both cited values);
+    `/sources` returns them per cited field (`cited_fields[].matches`) and in `number_matches` (incl. `unmatched`).
   - `/sources` resolves tool sources from the stored output: `product`, `location`, `cited_fields`, `why`, `row_data`.
     Reviews snapshot `tool_name`, `tool_arguments` and `tool_evidence` `{call_id, row, fields: [{field, value}]}`.
   - Specialists answer with `output_schema` (checked sources); the orchestrator copies their sources.
@@ -176,7 +180,9 @@ orchestrator's `tool` entry for the delegation (with `child_trace`).
 `sources` is always added).
 
 **Answer style** (`ANSWER_STYLE` in service.py, added to every prompt): product and location names, not codes;
-at most ~10 claims unless asked for more.
+at most ~10 claims unless asked for more. **Language** is decided in code (`app/agent/language.py`: æ/ø/å or ≥ 2 common
+Norwegian words → Norwegian, else English) and added last to the prompt as "Answer in <language>." (specialists: from
+their question).
 
 **Anthropic note:** `claude-sonnet-5-5` rejects a forced `tool_choice`; the adapter retries without it
 (the loop has already asked for `submit_answer` in the conversation). `max_tokens` is 16000.

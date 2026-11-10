@@ -43,15 +43,28 @@ def flatten(value) -> list:
     return [value]
 
 
-def _numbers_and_dates(values) -> tuple[list[float], set[tuple[int, int]]]:
-    numbers, dates = [], set()
-    for v in flatten(values):
-        if isinstance(v, (int, float)):
-            numbers.append(float(v))
-        elif isinstance(v, str):
-            for y, m, d in ISO_DATE.findall(v):
-                dates.add((int(m), int(d)))
-    return numbers, dates
+def leaves(fields) -> list[tuple[str, object]]:
+    """[(path, value)] for every number and string in the cited fields.
+    fields = {"next_order.qty": 40, "why.forecast_weekly_units": [79.6, 69.8]} -> "why.forecast_weekly_units[1]" etc.
+    A plain list of values is named value[0], value[1], ..."""
+    if not isinstance(fields, dict):
+        fields = {f"value[{i}]": v for i, v in enumerate(fields)}
+    out = []
+
+    def walk(path, v):
+        if isinstance(v, bool) or v is None:
+            return
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(f"{path}.{k}", x)
+        elif isinstance(v, (list, tuple)):
+            for n, x in enumerate(v):
+                walk(f"{path}[{n}]", x)
+        else:
+            out.append((path, v))
+    for path, v in fields.items():
+        walk(path, v)
+    return out
 
 
 # ---------- what the claim says ----------
@@ -105,7 +118,7 @@ def claim_numbers(text: str) -> list[tuple[float, float, bool, str]]:
 def strip_names(text: str, names) -> str:
     """Remove names that contain digits ("Røkt laks 300 g") so their digits aren't read as claims."""
     for name in sorted({n for n in names if n}, key=len, reverse=True):
-        text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
+        text = re.sub(re.escape(name), lambda m: " " * len(m.group(0)), text, flags=re.IGNORECASE)  # same length
     return text
 
 
@@ -115,19 +128,51 @@ def _close(candidate: float, value: float, step: float) -> bool:
     return abs(abs(candidate) - value) <= step / 2 + 1e-9
 
 
-def claim_mismatches(text: str, values, names=()) -> list[str]:
-    """Numbers and dates in `text` that none of the cited `values` explain (empty list = all fine)."""
-    numbers, dates = _numbers_and_dates(values)
+def explain(text: str, fields, names=()) -> tuple[list[dict], list[str]]:
+    """Match every number and date in `text` to the cited `fields` -> (matches, problems).
+
+    Each match: {"text": "414k", "match_type": ..., "field": ..., "cited_value": ...}, where
+    match_type is exact | rounded | percent (fraction shown as %) | factor (1.72 shown as +72%) | date |
+    difference (then "fields" and "cited_values" hold the two values subtracted).
+    problems: ['number "400"', 'date "9 Nov"'] for what no cited value explains.
+    """
+    cited = leaves(fields)
+    numbers = [(p, v) for p, v in cited if isinstance(v, (int, float))]     # v as cited (40, not 40.0)
+    dates = [(p, v, (int(m), int(d))) for p, v in cited if isinstance(v, str) for _, m, d in ISO_DATE.findall(v)]
     found_dates, rest = claim_dates(strip_names(text, names))
     rest = YEAR.sub(" ", rest)
-    problems = [f'date "{shown}"' for month, day, shown in found_dates if (month, day) not in dates]
+    matches, problems = [], []
 
-    differences = [abs(a - b) for a, b in combinations(numbers, 2)]
-    for value, step, percent, shown in claim_numbers(rest):
-        if percent:
-            candidates = [n * 100 for n in numbers] + [(n - 1) * 100 for n in numbers] + numbers
+    for month, day, shown in found_dates:
+        hit = next(((p, v) for p, v, md in dates if md == (month, day)), None)
+        if hit:
+            matches.append({"text": shown, "match_type": "date", "field": hit[0], "cited_value": hit[1]})
         else:
-            candidates = numbers + differences
-        if not any(_close(c, value, step) for c in candidates):
+            problems.append(f'date "{shown}"')
+
+    for value, step, percent, shown in claim_numbers(rest):
+        match = None
+        tries = [(n, "exact" if abs(n - value) < 1e-9 else "rounded", p, n) for p, n in numbers]
+        if percent:
+            tries = ([(n * 100, "percent", p, n) for p, n in numbers]
+                     + [((n - 1) * 100, "factor", p, n) for p, n in numbers] + tries)
+        for candidate, kind, path, cited_value in tries:
+            if _close(candidate, value, step):
+                match = {"text": shown, "match_type": kind, "field": path, "cited_value": cited_value}
+                break
+        if match is None and not percent:
+            for (pa, a), (pb, b) in combinations(numbers, 2):
+                if _close(a - b, value, step):
+                    match = {"text": shown, "match_type": "difference", "fields": [pa, pb],
+                             "cited_values": [a, b] if a >= b else [b, a]}
+                    break
+        if match:
+            matches.append(match)
+        else:
             problems.append(f'number "{shown}"')
-    return list(dict.fromkeys(problems))   # unique, in order
+    return matches, list(dict.fromkeys(problems))   # problems: unique, in order
+
+
+def claim_mismatches(text: str, values, names=()) -> list[str]:
+    """Numbers and dates in `text` that none of the cited `values` explain (empty list = all fine)."""
+    return explain(text, values, names)[1]

@@ -108,7 +108,10 @@ def get_sources(run_id: UUID):
     resolved = sources.resolve_sources(str(run_id))
     if resolved is None:
         raise HTTPException(404, "Run not found")
-    return {"run_id": str(run_id), "summary": sources.review_summary(resolved), "sources": resolved}
+    answer = (runs.get_run(str(run_id)) or {}).get("answer")
+    answer = answer if isinstance(answer, dict) else {}
+    return {"run_id": str(run_id), "summary": sources.review_summary(resolved), "sources": resolved,
+            "warnings": answer.get("warnings", []), "unverified_numbers": answer.get("unverified_numbers", [])}
 
 
 class Review(BaseModel):

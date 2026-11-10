@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from app import runs
 from app.agent import approvals
+from app.agent.language import detect_language
 from app.agent.loop import run_agent
 from app.agent.orchestrator import ORCHESTRATOR_PROMPT, make_delegation_tools
 from app.llm import Tool, ToolCall
@@ -41,7 +42,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 # Added to every prompt (agent, orchestrator and specialists)
 ANSWER_STYLE = (
-    "Answer style: answer in the language of the user's question. Write product and location names "
+    "Answer style: write product and location names "
     "(e.g. \"Røkt laks 300 g at Høyden Nettbutikk\"), not codes like SKU009 or L04 (codes only go in tool "
     "arguments and in the `row` of a source). Write dates like \"6 Nov\". Keep answers concise: at most 10 "
     "cited claims ([n] markers) unless the user asks for more; pick the ones with the biggest NOK impact and "
@@ -56,7 +57,8 @@ class RunRequest(BaseModel):
     mode: Literal["agent", "orchestrator"] = "agent"   # orchestrator = delegate to two specialists
 
 
-def build_system_prompt(custom: str | None, tables: bool = True, documents: bool = True) -> str:
+def build_system_prompt(custom: str | None, tables: bool = True, documents: bool = True,
+                        language: str | None = None) -> str:
     """Caller's prompt (or the default) + business context + the current tables and/or documents.
 
     Read fresh each run (no caching), so new uploads show up immediately.
@@ -72,6 +74,8 @@ def build_system_prompt(custom: str | None, tables: bool = True, documents: bool
             parts.append(describe())
         except Exception:
             pass
+    if language:   # last, so it wins over the Norwegian case background; decided in code (language.py)
+        parts.append(f"Answer in {language}.")
     return "\n\n".join(parts)
 
 
@@ -130,7 +134,7 @@ def execute(req: RunRequest, on_event: Callable[[dict], None] | None = None) -> 
 
     default_prompt = ORCHESTRATOR_PROMPT if req.mode == "orchestrator" else DEFAULT_SYSTEM_PROMPT
     try:
-        result = run_agent(build_system_prompt(req.system_prompt or default_prompt),
+        result = run_agent(build_system_prompt(req.system_prompt or default_prompt, language=detect_language(req.task)),
                            tools_for_run(run_id, req.mode, emit), req.task,
                            output_schema=req.output_schema, on_event=on_step,
                            run_id=run_id, approve=make_approver(run_id, trace),

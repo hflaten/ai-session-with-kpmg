@@ -11,8 +11,9 @@ With output_schema, the final answer must come through the submit_answer tool
 (see structured.py). It is validated against the schema, it always contains a
 `sources` list, and every source is checked against what the agent actually
 found in this run. Tool citations are also checked against the cited call's stored
-output (row, fields, numbers); those mismatches are sent back twice, then the answer
-is accepted with a `warnings` list.
+output (row, fields, numbers); those mismatches are sent back twice, and sentences with
+numbers but no marker once; after that the answer is accepted with a `warnings` list
+(and `unverified_numbers` with the exact text spans).
 
 Every tool call gets a call_id ("rc-3f9a1c"). Citable tools see it in their result, so
 the model can cite it; the full output is kept (tool_calls.remember) and handed to
@@ -34,13 +35,16 @@ from typing import Any, Callable
 
 from app.agent import tool_calls
 from app.agent.structured import (CITABLE_TOOLS, SUBMIT_TOOL_NAME, Evidence, citation_errors, evidence_errors,
-                                  make_submit_tool, marker_errors, unmarked_fact_errors, validation_errors,
+                                  describe_unmarked, make_submit_tool, marker_errors, unmarked_numbers,
+                                  validation_errors,
                                   with_sources)
 from app.llm import Tool, ToolCall, call_llm
 
 MAX_TOOL_OUTPUT_CHARS = 20_000   # what the LLM sees from one tool call
 MAX_TRACE_OUTPUT_CHARS = 2_000   # what the trace keeps (readability); full outputs go to tool_calls
-MAX_SOFT_REJECTIONS = 2          # tool-evidence mismatches: send back twice, then accept with warnings
+# Soft problems are sent back a limited number of times, then the answer is accepted with warnings:
+MAX_EVIDENCE_REJECTIONS = 2      # tool-evidence mismatches (row, fields, numbers vs cited values)
+MAX_UNMARKED_REJECTIONS = 1      # sentences with numbers but no [n] marker -> then `unverified_numbers`
 
 
 # Two-phase approval, so a fast "approve" click can never arrive before we're listening:
@@ -112,7 +116,7 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
     trace: list[dict] = []
     evidence = Evidence()  # chunks found and SQL run, for checking citations
     force_tool = None      # set when the model must call submit_answer next
-    soft_rejections = 0    # answers sent back only for tool-evidence mismatches
+    rejections = {"evidence": 0, "unmarked": 0}   # how often each soft problem was sent back
 
     def record(entry: dict) -> None:
         trace.append(entry)
@@ -148,24 +152,34 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
             started = time.monotonic()
 
             if call.name == SUBMIT_TOOL_NAME and output_schema:
-                errors = validation_errors(output_schema, call.input)
-                if not errors:
-                    errors = (citation_errors(call.input["sources"], evidence) + marker_errors(call.input)
-                              + unmarked_fact_errors(call.input, evidence.names))
-                soft = [] if errors else evidence_errors(call.input, evidence)
-                accept_with_warnings = bool(soft) and soft_rejections >= MAX_SOFT_REJECTIONS
-                valid = not errors and (not soft or accept_with_warnings)
-                record({"step": step, "type": "final_answer", "input": call.input, "valid": valid,
-                        "errors": errors + ([] if accept_with_warnings else soft),
-                        "warnings": soft if accept_with_warnings else [],
-                        "ms": int((time.monotonic() - started) * 1000)})
-                if valid:
-                    answer = {**call.input, "warnings": soft} if accept_with_warnings else call.input
+                # Hard problems are always sent back: bad shape, citations that didn't happen, markers
+                hard = validation_errors(output_schema, call.input)
+                if not hard:
+                    hard = citation_errors(call.input["sources"], evidence) + marker_errors(call.input)
+                unmarked = [] if hard else unmarked_numbers(call.input, evidence.names)
+                mismatches = [] if hard else evidence_errors(call.input, evidence)
+                send_back = bool(hard) or (bool(unmarked) and rejections["unmarked"] < MAX_UNMARKED_REJECTIONS) \
+                    or (bool(mismatches) and rejections["evidence"] < MAX_EVIDENCE_REJECTIONS)
+                ms = int((time.monotonic() - started) * 1000)
+                if send_back:
+                    if not hard:
+                        rejections["unmarked"] += bool(unmarked)
+                        rejections["evidence"] += bool(mismatches)
+                    errors = hard + describe_unmarked(unmarked) + mismatches
+                    record({"step": step, "type": "final_answer", "input": call.input, "valid": False,
+                            "errors": errors, "warnings": [], "ms": ms})
+                    output_text = ("Your answer was rejected. Fix these and call submit_answer again:\n"
+                                   + "\n".join(errors))
+                else:
+                    warnings = mismatches + [f'unverified number: "{u["text"]}"' for u in unmarked]
+                    answer = dict(call.input)
+                    if warnings:
+                        answer["warnings"] = warnings
+                    if unmarked:
+                        answer["unverified_numbers"] = unmarked
+                    record({"step": step, "type": "final_answer", "input": call.input, "valid": True,
+                            "errors": [], "warnings": warnings, "ms": ms})
                     return AgentResult(answer=answer, trace=trace, evidence=evidence)
-                if not errors:
-                    soft_rejections += 1
-                output_text = ("Your answer was rejected. Fix these and call submit_answer again:\n"
-                               + "\n".join(errors + soft))
             else:
                 tool = tools_by_name.get(call.name)
 

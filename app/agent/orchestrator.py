@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from app import runs
+from app.agent.language import detect_language
 from app.agent.loop import run_agent
 from app.llm import Tool
 from app.tools.database import query_database_tool
@@ -97,7 +98,8 @@ def make_delegation_tools(parent_run_id: str, emit: Callable[[dict], None],
                 emit({**entry, "agent": spec.name, "run_id": child_run_id})
 
             try:
-                prompt = build_prompt(spec.system_prompt, tables=spec.sees_tables, documents=spec.sees_documents)
+                prompt = build_prompt(spec.system_prompt, tables=spec.sees_tables, documents=spec.sees_documents,
+                                      language=detect_language(question))
                 result = run_agent(prompt, spec.tools, question, output_schema=SPECIALIST_SCHEMA,
                                    on_event=forward, run_id=child_run_id,
                                    on_tool_output=tool_output_saver(child_run_id) if tool_output_saver else None)

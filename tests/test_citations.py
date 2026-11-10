@@ -377,3 +377,50 @@ def test_rounded_thousands_and_norwegian_dates():
     assert claim_mismatches("bestill innen 6. nov", ["2026-11-06"]) == []
     text = "Røkt laks 300 g: bestill 40 stk 6. nov [1]."
     assert unmarked_fact_errors({"answer": text, "sources": []}, {"Røkt laks 300 g"}) == []   # one sentence, marked
+
+
+# ---------- unmarked numbers: one resubmission, then accepted with exact spans ----------
+
+def test_unmarked_numbers_have_exact_spans():
+    from app.agent.structured import unmarked_numbers
+    text = "## Plan\nRøkt laks 300 g: order 40 [1]. The plan covers 56 days.\n- Bestill 6. nov 12 stk."
+    found = unmarked_numbers({"answer": text, "sources": []}, {"Røkt laks 300 g"})
+    assert [text[u["start"]:u["end"]] for u in found] == ["The plan covers 56 days.", "Bestill 6. nov 12 stk."]
+    assert [[text[n["start"]:n["end"]] for n in u["numbers"]] for u in found] == [["56"], ["6", "12"]]
+    assert all(u["field"] == "answer" for u in found)
+
+
+def test_unmarked_number_sent_back_once_then_accepted_with_unverified_numbers(monkeypatch):
+    seen = []
+
+    def fake(system, messages, tools, force_tool=None):
+        seen.append(messages[-1])
+        if len(seen) == 1:
+            return LLMResponse("", [ToolCall("a", "search_documents", {"query": "q"})])
+        return LLMResponse("", [ToolCall(f"s{len(seen)}", "submit_answer", {
+            "answer": "Target is 45% [1]. The board meets in 2 weeks.", "sources": [DOC_SOURCE]})])
+    monkeypatch.setattr(loop, "call_llm", fake)
+    r = loop.run_agent("sys", [FAKE_SEARCH], "q", output_schema=SCHEMA)
+    finals = [e for e in r.trace if e["type"] == "final_answer"]
+    assert [e["valid"] for e in finals] == [False, True]                 # one resubmission only
+    assert "has no marker" in seen[2]["content"]
+    (u,) = r.answer["unverified_numbers"]
+    assert u["text"] == "The board meets in 2 weeks." and u["numbers"][0]["text"] == "2"
+    assert r.answer["answer"][u["start"]:u["end"]] == u["text"]
+    assert r.answer["warnings"] == ['unverified number: "The board meets in 2 weeks."']
+
+
+# ---------- match types ----------
+
+def test_match_types_are_recorded():
+    from app.agent.numbers import explain
+    fields = {"next_order.qty": 40, "next_order.order_date": "2026-11-06", "a": 414493, "b": 9745,
+              "why.trend": 1.091, "rate": 0.0357, "w": [79.6, 69.8]}
+    matches, problems = explain("Order 40 by 6 Nov; lost 414k, saves 405k; up 9%; rate 3.6%; week 2: 69.8", fields)
+    assert {m["text"]: m["match_type"] for m in matches} == {
+        "6 Nov": "date", "40": "exact", "414k": "rounded", "405k": "difference", "9%": "factor", "3.6%": "percent",
+        "69.8": "exact"}
+    assert problems == ['number "2"']
+    diff = next(m for m in matches if m["match_type"] == "difference")
+    assert diff["fields"] == ["a", "b"] and diff["cited_values"] == [414493, 9745]
+    assert next(m for m in matches if m["text"] == "69.8")["field"] == "w[1]"

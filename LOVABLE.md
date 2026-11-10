@@ -177,6 +177,21 @@ For tool sources it also checked that the row and fields exist in that call's st
 that **every number and date in the claim matches a cited value** (rounding like "414k" or "46%"
 is allowed). If the model still got a number wrong after two corrections, the answer is accepted
 with a **`warnings`** list (strings) next to `sources`: show them in an amber box above the answer.
+
+Sentences with a number but no `[n]` marker are sent back once; after that the answer is accepted
+and lists them in **`unverified_numbers`**, with exact positions in that text field:
+
+```json
+"unverified_numbers": [{"field": "answer", "start": 412, "end": 447, "text": "The plan covers 56 days ahead.",
+                        "numbers": [{"text": "56", "start": 428, "end": 430}]}]
+```
+
+`answer.slice(start, end) === text`; highlight each `numbers` span (or the whole sentence) in yellow.
+`warnings` then also contains `unverified number: "…"` lines. `GET /runs/{id}/sources` repeats both
+(`warnings`, `unverified_numbers`) at the top level.
+
+The backend answers in the language of the question (Norwegian if it has æ/ø/å or common
+Norwegian words, else English).
 One claim can have several entries.
 
 ### Inline markers `[n]` — one marker = one claim
@@ -270,7 +285,12 @@ the inline `marker` (`index + 1`) and the latest human `review` (section 8):
  "tool": "recommend_orders", "call_id": "rc-3f9a1c", "arguments": {},
  "row": {"sku": "SKU009", "location_id": "L04"}, "fields": ["next_order.qty", "next_order.order_date"],
  "product": "Røkt laks 300 g", "location": "Høyden Nettbutikk",
- "cited_fields": [{"field": "next_order.qty", "value": 40}, {"field": "next_order.order_date", "value": "2026-11-06"}],
+ "cited_fields": [{"field": "next_order.qty", "value": 40,
+                   "matches": [{"text": "40", "match_type": "exact", "in": "answer"}]},
+                  {"field": "next_order.order_date", "value": "2026-11-06",
+                   "matches": [{"text": "6 Nov", "match_type": "date", "in": "answer"}]}],
+ "number_matches": [{"text": "40", "match_type": "exact", "field": "next_order.qty", "cited_value": 40, "in": "answer"},
+                    {"text": "405k", "match_type": "difference", "fields": ["a", "b"], "cited_values": [414493, 9745], "in": "answer"}],
  "why": {"forecast_basis": "same days last year, stockout-corrected, x trend", "trend": 1.091,
          "last_8_weeks_units": 675, "same_8_weeks_last_year_units": 618, "forecast_daily_avg": 19.92,
          "lead_time_days": 2, "lead_time_sd_days": 1, "on_hand": 0, "on_order": 70, "shelf_life_days": 14,
@@ -280,6 +300,10 @@ the inline `marker` (`index + 1`) and the latest human `review` (section 8):
 ```
 
   The evidence is the call's **stored** output (not re-run), so it shows exactly what the agent saw.
+  `match_type`: `exact`, `rounded` ("414k" for 414 493), `percent` (0.036 shown as 3.6 %), `factor`
+  (1.72 shown as "+72 %"), `date`, `difference` (`fields`/`cited_values` = the two values subtracted), or
+  `unmatched` (a number nothing explains). `in` says whether it was found in the answer text or the
+  source's own `claim`.
   For `row: "summary"`, `product`/`location`/`why` are null and `method` explains the totals.
 - `error` is non-null if the evidence is gone (e.g. data was reset) — show it instead.
 
@@ -698,38 +722,52 @@ Paste into the existing Lovable project (after the citations/claim-review prompt
 ````text
 Update how cited sources are shown in the chat (keep everything else). Do not invent fields.
 
-1. Answer warnings: a structured answer may have `warnings` (array of strings) next to `sources`.
-   If present and non-empty, show an amber box above the answer: "Some numbers could not be verified"
-   with the warnings as a list.
+1. Warnings banner: a structured answer may have `warnings` (array of strings) and
+   `unverified_numbers` next to `sources` (GET {BACKEND_URL}/runs/{run_id}/sources also returns both at
+   the top level). If warnings is non-empty, show an amber banner above the answer:
+   "Some numbers could not be verified" with a "Show details" toggle listing the warnings.
 
-2. Tool sources: in GET {BACKEND_URL}/runs/{run_id}/sources, a source with kind "tool" has:
-   claim, tool, call_id, arguments, row ({sku, location_id} or the string "summary"), fields (array of
-   field paths), product, location (names, may be null), cited_fields ([{field, value}]),
-   why (object or null), row_data (the whole row object), method (string or null), error (string or null),
-   marker, review.
+2. Unverified numbers in the answer: `unverified_numbers` is
+   [{field, start, end, text, numbers: [{text, start, end}]}]; start/end are character positions in
+   the answer's text field named `field` (usually "answer"), so answer.slice(start, end) === text.
+   When rendering that text, wrap each numbers[i] span in a yellow highlight (background #FEF08A) with
+   the tooltip "Not verified: no source for this number". Apply these highlights BEFORE splitting the
+   text into claims with splitClaims (positions refer to the raw text). They are not clickable.
+
+3. Tool sources: in GET {BACKEND_URL}/runs/{run_id}/sources, a source with kind "tool" has:
+   claim, tool, call_id, arguments, row ({sku, location_id} or the string "summary"), fields,
+   product, location (names, may be null), cited_fields ([{field, value, matches: [{text, match_type, in}]}]),
+   number_matches, why (object or null), row_data (the whole row), method (string or null),
+   error (string or null), marker, review.
    When the user clicks a highlighted claim (or its [n]) whose source is kind "tool", open a right-side
    sheet ("Source [n]") instead of the document/SQL view:
    - Title: product and location ("Røkt laks 300 g · Høyden Nettbutikk"); for row "summary" use
      "Plan totals". Subtitle: "Calculated by {tool} · call {call_id}" in small grey monospace.
    - The claim text in a quote block.
-   - "Cited values": a two-column table of cited_fields (field → value). Make field paths readable:
-     "next_order.qty" → "Next order · qty"; values: numbers with space thousands separators, ISO dates as
-     "6 Nov 2026", NOK fields (name ends with _nok) as "NOK 49 235". These rows are highlighted (yellow
-     background, bold) — they are the evidence.
+   - "Cited values": a table with columns Field, Value, Match. Field paths readable
+     ("next_order.qty" → "Next order · qty"); values with space thousands separators, ISO dates as
+     "6 Nov 2026", fields ending in _nok as "NOK 49 235". Rows are highlighted (yellow background,
+     bold) — they are the evidence. Match column: one small badge per entry in `matches`, showing the
+     text as written plus the type: exact (green "exact"), rounded (green "≈ rounded"), percent (blue
+     "as %"), factor (blue "as % change"), date (green "date"), difference (purple "difference").
+     Hover on a badge: "“414k” in the answer matches 414 493 (rounded)". If a number_matches entry has
+     match_type "unmatched", show it under the table in red: "“400” — not found in the cited values".
+     For a "difference" entry in number_matches, show a line "405k = 414 493 − 9 745" under the table.
    - "Why": a definition list from `why` with friendly labels: forecast_basis "Forecast basis",
-     trend "Trend vs last year" (show as "+9.1 %" from 1.091), last_8_weeks_units vs same_8_weeks_last_year_units
-     "Last 8 weeks vs same weeks last year", forecast_daily_avg "Forecast per day", lead_time_days ± lead_time_sd_days
-     "Lead time (days)", on_hand "In stock", on_order "On order", shelf_life_days "Shelf life (days)",
-     planned_promotions "Planned promotions" (start–end dates). Skip missing keys. For "summary" show
-     `method` as a paragraph instead.
+     trend "Trend vs last year" (1.091 → "+9.1 %"), last_8_weeks_units vs same_8_weeks_last_year_units
+     "Last 8 weeks vs same weeks last year", forecast_daily_avg "Forecast per day", lead_time_days ±
+     lead_time_sd_days "Lead time (days)", on_hand "In stock", on_order "On order", shelf_life_days
+     "Shelf life (days)", planned_promotions "Planned promotions" (start–end). Skip missing keys. For
+     "summary" show `method` as a paragraph instead.
    - "Full row" (collapsed by default): row_data as a key/value table; fields listed in `fields` are
-     highlighted the same way as above (nested objects shown as "parent · child").
+     highlighted the same way (nested objects shown as "parent · child").
    - If `error` is set, show it in red instead of the tables.
    - At the bottom: the existing Accept / Reject buttons for this claim (POST
      /runs/{run_id}/claims/{marker}/review), showing the current review if there is one.
-3. In the sources list under the answer, tool sources show a 🧮 icon with "{product} · {location}"
+4. In the sources list under the answer, tool sources show a 🧮 icon with "{product} · {location}"
    (or "Plan totals") and the first cited value, e.g. "Next order · qty: 40".
 
 Check: ask "What should we order for Christmas?". Clicking a salmon claim opens the sheet with
-product + location, the cited values highlighted (e.g. qty 40), and the Why list with the trend and lead time.
+product + location, the cited values highlighted with match badges (e.g. 40 · exact), and the Why list.
+Ask "Hva bør vi bestille til jul?" and the answer comes back in Norwegian.
 ````

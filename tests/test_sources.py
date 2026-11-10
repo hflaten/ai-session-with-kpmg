@@ -113,9 +113,27 @@ def test_tool_source_resolves_the_cited_row_with_names_fields_and_why(monkeypatc
     r = resolve_tool_source({"claim": "Order 40", "tool": "recommend_orders", "call_id": "rc-sheet1",
                              "row": {"sku": "SKU009", "location_id": "L04"}, "fields": ["next_order.qty"]})
     assert (r["product"], r["location"], r["error"]) == ("Røkt laks 300 g", "Høyden Nettbutikk", None)
-    assert r["cited_fields"] == [{"field": "next_order.qty", "value": 40}]
+    assert r["cited_fields"] == [{"field": "next_order.qty", "value": 40,
+                                  "matches": [{"text": "40", "match_type": "exact", "in": "source"}]}]
     assert r["why"] == {"forecast_basis": "same days last year", "trend": 1.09, "lead_time_days": 2, "on_hand": 0}
     assert r["arguments"] == {"sku": "SKU009"} and r["row_data"]["next_order"]["order_date"] == "2026-11-06"
     missing = resolve_tool_source({"claim": "x", "tool": "recommend_orders", "call_id": "rc-gone00",
                                    "row": "summary", "fields": ["x"]})
     assert missing["error"] and missing["row_data"] is None
+
+
+def test_tool_source_shows_match_types_per_cited_field():
+    from app.agent import tool_calls
+    from app.sources import resolve_tool_source
+    output = {"call_id": "rc-sheet2", "rows": [{"sku": "SKU009", "location_id": "L04", "product": "Røkt laks 300 g",
+              "without_recommendation": {"lost_sales_nok": 49235}, "next_order": {"qty": 40}}]}
+    tool_calls.remember("rc-sheet2", "recommend_orders", {}, output)
+    s = {"claim": "Order 40, else NOK 49,235 lost", "tool": "recommend_orders", "call_id": "rc-sheet2",
+         "row": {"sku": "SKU009", "location_id": "L04"},
+         "fields": ["next_order.qty", "without_recommendation.lost_sales_nok"]}
+    r = resolve_tool_source(s, answer_claim="Order 40 units of Røkt laks 300 g, or lose about NOK 49k")
+    by_field = {c["field"]: c["matches"] for c in r["cited_fields"]}
+    assert {"text": "40", "match_type": "exact", "in": "answer"} in by_field["next_order.qty"]
+    assert {"text": "49k", "match_type": "rounded", "in": "answer"} in by_field["without_recommendation.lost_sales_nok"]
+    assert {"text": "49,235", "match_type": "exact", "in": "source"} in by_field["without_recommendation.lost_sales_nok"]
+    assert not any(m["match_type"] == "unmatched" for m in r["number_matches"])

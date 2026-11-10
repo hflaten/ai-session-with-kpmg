@@ -263,7 +263,8 @@ def answer_text(answer) -> str:
     if isinstance(answer, str):
         return answer
     if isinstance(answer, dict):
-        return "\n".join(answer_text(v) for k, v in answer.items() if k != "sources")
+        return "\n".join(answer_text(v) for k, v in answer.items()
+                         if k not in ("sources", "warnings", "unverified_numbers"))
     if isinstance(answer, list):
         return "\n".join(answer_text(v) for v in answer)
     return ""
@@ -297,9 +298,54 @@ NORWEGIAN_DATE = re.compile(r"\b(\d{1,2})\.(?=\s+(?:jan|feb|mar|apr|mai|jun|jul|
 
 
 def _no_date_dots(text: str) -> str:
-    """"6. nov" -> "6 nov", so the dot in a Norwegian date is not read as the end of a sentence."""
-    return NORWEGIAN_DATE.sub(r"\1", text)
+    """"6. nov" -> "6  nov", so the dot in a Norwegian date is not read as the end of a sentence.
+    (Same length as the input, so character positions stay valid.)"""
+    return NORWEGIAN_DATE.sub(r"\1 ", text)
 LIST_PREFIX = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")          # "- " or "1. " list bullets
+
+
+NUMBER_SPAN = re.compile(r"\d+(?:[.,  ]\d+)*\s?%?")
+
+
+def text_fields(answer, path: str = "") -> list[tuple[str, str]]:
+    """[(path, text)] for every text in the answer except sources/warnings: [("answer", "...")]"""
+    if isinstance(answer, str):
+        return [(path, answer)]
+    if isinstance(answer, dict):
+        return [x for k, v in answer.items() if k not in ("sources", "warnings", "unverified_numbers")
+                for x in text_fields(v, f"{path}.{k}" if path else k)]
+    if isinstance(answer, list):
+        return [x for n, v in enumerate(answer) for x in text_fields(v, f"{path}[{n}]")]
+    return []
+
+
+def unmarked_numbers(answer: dict, names=()) -> list[dict]:
+    """Sentences that contain a number, percentage or date but no marker, with exact positions:
+    [{"field": "answer", "start": 120, "end": 168, "text": "...", "numbers": [{"text": "56", "start": 131, "end": 133}]}]
+    start/end index into that field's text. Headings and list numbering are skipped; digits inside
+    `names` (e.g. "Røkt laks 300 g") don't count; spelled-out numbers ("four") are not detected."""
+    found = []
+    for field, text in text_fields(answer):
+        masked = _no_date_dots(strip_names(text, names))        # same length as text
+        for line in re.finditer(r"[^\n]+", masked):
+            if line.group(0).lstrip().startswith("#"):
+                continue
+            prefix = LIST_PREFIX.match(line.group(0))
+            begin = line.start() + (prefix.end() if prefix else 0)
+            cuts = [begin] + [line.start() + m.end() for m in SENTENCE_END.finditer(line.group(0))
+                              if line.start() + m.end() > begin] + [line.end()]
+            for a, b in zip(cuts, cuts[1:]):
+                sentence = masked[a:b]
+                if MARKER.search(sentence):
+                    continue
+                spans = [(a + m.start(), a + m.start() + len(m.group(0).rstrip())) for m in NUMBER_SPAN.finditer(sentence)]
+                numbers = [{"text": text[x:y], "start": x, "end": y} for x, y in spans]
+                if numbers:
+                    lead = len(sentence) - len(sentence.lstrip())
+                    start, end = a + lead, a + len(sentence.rstrip())
+                    found.append({"field": field, "start": start, "end": end, "text": text[start:end],
+                                  "numbers": numbers})
+    return found
 
 
 def unmarked_fact_errors(answer: dict, names=()) -> list[str]:
@@ -307,24 +353,18 @@ def unmarked_fact_errors(answer: dict, names=()) -> list[str]:
 
     Catches claims whose marker sits after a later sentence ("Target is 45%. It is
     defined as ... [1]."), so every fact gets its own reviewable marker.
-    Markdown headings are skipped; spelled-out numbers ("four") are not detected.
-    Digits inside `names` (e.g. "Røkt laks 300 g") don't count.
     """
-    errors = []
-    for line in _no_date_dots(strip_names(answer_text(answer), names)).splitlines():
-        if line.lstrip().startswith("#"):
-            continue
-        for sentence in SENTENCE_END.split(LIST_PREFIX.sub("", line)):   # drop "1. " before splitting
-            if MARKER.search(sentence):
-                continue
-            if re.search(r"\d", sentence):
-                shown = sentence.strip()
-                shown = shown if len(shown) <= 90 else shown[:87] + "..."
-                errors.append(f'sentence "{shown}" contains a number, percentage or date but has no marker. '
-                              "Make it its own claim: add an entry to sources and put [n] right after it, "
-                              "or remove the number if you have no evidence for it")
-    return errors
+    return describe_unmarked(unmarked_numbers(answer, names))
 
+
+def describe_unmarked(found: list[dict]) -> list[str]:
+    errors = []
+    for u in found:
+        shown = u["text"] if len(u["text"]) <= 90 else u["text"][:87] + "..."
+        errors.append(f'sentence "{shown}" contains a number, percentage or date but has no marker. '
+                      "Make it its own claim: add an entry to sources and put [n] right after it, "
+                      "or remove the number if you have no evidence for it")
+    return errors
 
 
 # ---------- tool evidence: row, fields, numbers (soft checks) ----------

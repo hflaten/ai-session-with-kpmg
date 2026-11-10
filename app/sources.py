@@ -14,15 +14,17 @@ Each source also gets its inline `marker` ([n] = index + 1) and its latest human
 """
 from app import db, reviews, runs
 from app.agent import tool_calls
-from app.agent.structured import cited_values
+from app.agent.numbers import explain
+from app.agent.structured import answer_text, cited_values, claim_spans, names_in
 from app.tools.database import query_database
 
 WHY_KEYS = ("forecast_basis", "trend", "last_8_weeks_units", "same_8_weeks_last_year_units", "forecast_daily_avg",
             "lead_time_days", "lead_time_sd_days", "on_hand", "on_order", "shelf_life_days", "planned_promotions")
 
 
-def resolve_tool_source(s: dict) -> dict:
-    """{kind: "tool", ..., arguments, row, product, location, cited_fields: [{field, value}], why, error}"""
+def resolve_tool_source(s: dict, answer_claim: str | None = None) -> dict:
+    """{kind: "tool", ..., arguments, row, product, location, cited_fields: [{field, value, matches}],
+    number_matches, why, error}. answer_claim = the claim as written in the answer text (before its [n])."""
     stored = tool_calls.recall(s["call_id"])
     row, values, problems = cited_values(s)
     base = {"kind": "tool", **s, "arguments": stored["arguments"] if stored else None}
@@ -30,10 +32,25 @@ def resolve_tool_source(s: dict) -> dict:
         return {**base, "row_data": None, "product": None, "location": None, "cited_fields": [], "why": None,
                 "error": "; ".join(problems)}
     why = row.get("why") or {}
+    # How each number/date in the claim was matched to the cited values (exact, rounded, percent, ...)
+    names = names_in(stored["output"])
+    number_matches = []
+    for where, text in (("answer", answer_claim), ("source", s["claim"])):
+        if text:
+            matches, unmatched = explain(text, values, names)
+            number_matches += [{**m, "in": where} for m in matches]
+            number_matches += [{"text": u.split('"')[1], "match_type": "unmatched", "in": where} for u in unmatched]
+
+    def matches_for(field):
+        return [{"text": m["text"], "match_type": m["match_type"], "in": m["in"]} for m in number_matches
+                if m.get("field", "").split("[")[0] == field
+                or any(f.split("[")[0] == field for f in m.get("fields", []))]
+
     return {**base,
             "row_data": row,                                   # the whole row, so the UI can show it as a sheet
             "product": row.get("product"), "location": row.get("location"),
-            "cited_fields": [{"field": f, "value": v} for f, v in values.items()],
+            "cited_fields": [{"field": f, "value": v, "matches": matches_for(f)} for f, v in values.items()],
+            "number_matches": number_matches,
             "why": {k: why[k] for k in WHY_KEYS if k in why} or None,
             "method": stored["output"].get("method") if s["row"] == "summary" else None,
             "error": "; ".join(problems) or None}
@@ -55,6 +72,10 @@ def resolve_sources(run_id: str) -> list[dict] | None:
         return []
 
     latest = reviews.latest_reviews(run_id)
+    spans = {}                                   # marker -> the claim as written in the answer text
+    for text, markers in claim_spans(answer_text(answer)):
+        for m in markers:
+            spans[m] = text.strip()
     resolved = []
     for i, s in enumerate(answer.get("sources", [])):
         base = {"index": i, "marker": i + 1, "review": latest.get(i + 1)}
@@ -63,7 +84,7 @@ def resolve_sources(run_id: str) -> list[dict] | None:
             resolved.append({**base, "kind": "document", **s, "text": text,
                              "error": None if text is not None else "chunk no longer exists (document re-uploaded or reset)"})
         elif "tool" in s:
-            resolved.append({**base, **resolve_tool_source(s)})
+            resolved.append({**base, **resolve_tool_source(s, spans.get(i + 1))})
         elif "sql" in s:
             try:
                 result = query_database(s["sql"])

@@ -4,7 +4,8 @@
 
 - document source -> the chunk's original text (from document_chunks)
 - database source -> the rows, by re-running the cited SQL as agent_readonly
-- tool source     -> the result, by re-running the cited (deterministic) tool with the cited arguments
+- tool source     -> the cited row from the call's stored output (tool_calls table): product and
+                     location names, the cited fields with their values, and the row's key inputs ("why")
 
 Only SQL stored in the run's validated answer is re-run (it passed the citation
 check, so the agent really ran it). The browser never sends SQL.
@@ -12,10 +13,30 @@ check, so the agent really ran it). The browser never sends SQL.
 Each source also gets its inline `marker` ([n] = index + 1) and its latest human `review`.
 """
 from app import db, reviews, runs
+from app.agent import tool_calls
+from app.agent.structured import cited_values
 from app.tools.database import query_database
-from app.tools.inventory import recommend_orders
 
-CITABLE = {"recommend_orders": recommend_orders}   # tool name -> function, for re-running tool sources
+WHY_KEYS = ("forecast_basis", "trend", "last_8_weeks_units", "same_8_weeks_last_year_units", "forecast_daily_avg",
+            "lead_time_days", "lead_time_sd_days", "on_hand", "on_order", "shelf_life_days", "planned_promotions")
+
+
+def resolve_tool_source(s: dict) -> dict:
+    """{kind: "tool", ..., arguments, row, product, location, cited_fields: [{field, value}], why, error}"""
+    stored = tool_calls.recall(s["call_id"])
+    row, values, problems = cited_values(s)
+    base = {"kind": "tool", **s, "arguments": stored["arguments"] if stored else None}
+    if row is None:
+        return {**base, "row_data": None, "product": None, "location": None, "cited_fields": [], "why": None,
+                "error": "; ".join(problems)}
+    why = row.get("why") or {}
+    return {**base,
+            "row_data": row,                                   # the whole row, so the UI can show it as a sheet
+            "product": row.get("product"), "location": row.get("location"),
+            "cited_fields": [{"field": f, "value": v} for f, v in values.items()],
+            "why": {k: why[k] for k in WHY_KEYS if k in why} or None,
+            "method": stored["output"].get("method") if s["row"] == "summary" else None,
+            "error": "; ".join(problems) or None}
 
 
 def _chunk_text(chunk_id: str) -> str | None:
@@ -42,11 +63,7 @@ def resolve_sources(run_id: str) -> list[dict] | None:
             resolved.append({**base, "kind": "document", **s, "text": text,
                              "error": None if text is not None else "chunk no longer exists (document re-uploaded or reset)"})
         elif "tool" in s:
-            try:
-                result = CITABLE[s["tool"]](**s["arguments"])
-                resolved.append({**base, "kind": "tool", **s, "result": result, "error": None})
-            except Exception as e:
-                resolved.append({**base, "kind": "tool", **s, "result": None, "error": f"{type(e).__name__}: {e}"})
+            resolved.append({**base, **resolve_tool_source(s)})
         elif "sql" in s:
             try:
                 result = query_database(s["sql"])

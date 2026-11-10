@@ -40,6 +40,8 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
 - `claim_reviews`: id, created_at, run_id (cascade), source_index (0-based) + generated `marker` (1-based), decision
   (accepted | rejected), reviewer, comment, plus a **snapshot** of the claim: claim, source_kind, document_name,
   page_number, chunk_id, table_name, sql_query. Newest row per claim is the current decision. Backend only; emptied by the reset script.
+- `tool_calls`: call_id (pk), created_at, run_id (cascade), tool, arguments, output (full jsonb). Backend only.
+  Emptied with `--include-runs`.
 - `proposed_orders`: id, created_at, run_id (set null), sku, location_id, qty (> 0), order_date, reason,
   status (approved | rejected), source (agent | dashboard), decided_by. Written by `create_purchase_order`
   after approval, or by `POST /orders` from the dashboard. RLS on, read policy for `agent_readonly`. Emptied by the reset script.
@@ -70,9 +72,19 @@ Lovable frontend ──HTTP/SSE──▶ FastAPI (Render) ──▶ LLM (Anthrop
   and `chunk_id` for every claim.
 - **Uploaded tables get comments:** when loading a CSV/Excel file, add a Postgres comment on
   the table and on **every column** describing it, so the agent sees them in its prompt.
-- **Tool claims** (inventory case): `{claim, tool, arguments}` for deterministic tools in `CITABLE_TOOLS`
-  (`recommend_orders`); must match a successful call with the same arguments (nulls ignored). `/sources`
-  re-runs the tool and returns `result`; reviews snapshot `tool_name` + `tool_arguments`.
+- **Tool claims** (inventory case): `{claim, tool, call_id, row: {sku, location_id} | "summary", fields: [dot paths]}`
+  for deterministic tools in `CITABLE_TOOLS` (`recommend_orders`). Every tool call gets a `call_id` (`rc-xxxxxx`,
+  `app/agent/tool_calls.py`); citable tools see it in their result. Full outputs are kept in memory and stored in
+  the `tool_calls` table (service.py `tool_output_saver`), so evidence can always be resolved.
+  - Hard check (`citation_errors`): the call_id ran in this run (own call, or a specialist's `tools_run`) and is that tool.
+  - Soft checks (`evidence_errors`): the row exists in that call's stored output, the fields exist, and every number and
+    date in the source's `claim` **and** in the claim span in the answer text (text before its markers, like
+    `splitClaims`) matches a cited value (`app/agent/numbers.py`: rounding to the precision shown, k/m, fraction→%,
+    factor→% change, the difference of two cited values; digits inside names like "Røkt laks 300 g" and years ignored).
+    Soft failures go back to the model; after 2 rejections the answer is accepted with `warnings` (also on the trace entry).
+  - `/sources` resolves tool sources from the stored output: `product`, `location`, `cited_fields`, `why`, `row_data`.
+    Reviews snapshot `tool_name`, `tool_arguments` and `tool_evidence` `{call_id, row, fields: [{field, value}]}`.
+  - Specialists answer with `output_schema` (checked sources); the orchestrator copies their sources.
 - **Database claims are cited too** (user's decision): `{claim, table, sql}`. The sql must be a
   query that ran successfully with query_database in this run, and the table must appear in it.
 - **Column comments on upload:** a generated summary (original header, counts, range, examples),
@@ -162,6 +174,9 @@ orchestrator's `tool` entry for the delegation (with `child_trace`).
 `answer` is a string, or an object matching `output_schema` when one is given
 (it must have `"type": "object"` at the top level and must not define `sources` itself —
 `sources` is always added).
+
+**Answer style** (`ANSWER_STYLE` in service.py, added to every prompt): product and location names, not codes;
+at most ~10 claims unless asked for more.
 
 **Anthropic note:** `claude-sonnet-5-5` rejects a forced `tool_choice`; the adapter retries without it
 (the loop has already asked for `submit_answer` in the conversation). `max_tokens` is 16000.

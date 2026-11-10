@@ -39,6 +39,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "Be concise and say when you are unsure."
 )
 
+# Added to every prompt (agent, orchestrator and specialists)
+ANSWER_STYLE = (
+    "Answer style: answer in the language of the user's question. Write product and location names "
+    "(e.g. \"Røkt laks 300 g at Høyden Nettbutikk\"), not codes like SKU009 or L04 (codes only go in tool "
+    "arguments and in the `row` of a source). Write dates like \"6 Nov\". Keep answers concise: at most 10 "
+    "cited claims ([n] markers) unless the user asks for more; pick the ones with the biggest NOK impact and "
+    "leave the rest out (say the full list is available)."
+)
+
 
 class RunRequest(BaseModel):
     task: str
@@ -54,7 +63,7 @@ def build_system_prompt(custom: str | None, tables: bool = True, documents: bool
     Specialists only get the context for their own tool (tables OR documents).
     If the database is unreachable the agent still runs, just without them.
     """
-    parts = [custom or DEFAULT_SYSTEM_PROMPT]
+    parts = [custom or DEFAULT_SYSTEM_PROMPT, ANSWER_STYLE]
     if business_context():
         parts.append(business_context())
     describers = ([describe_schema] if tables else []) + ([describe_documents] if documents else [])
@@ -69,10 +78,21 @@ def build_system_prompt(custom: str | None, tables: bool = True, documents: bool
 def tools_for_run(run_id: str, mode: str = "agent", emit: Callable[[dict], None] | None = None) -> list[Tool]:
     if mode == "orchestrator":
         # No direct data access: only delegation (+ the flagged write tools)
-        return [*make_delegation_tools(run_id, emit or (lambda e: None), build_system_prompt),
+        return [*make_delegation_tools(run_id, emit or (lambda e: None), build_system_prompt, tool_output_saver),
                 make_save_report_tool(run_id), make_create_purchase_order_tool(run_id)]
     return [query_database_tool, search_documents_tool, recommend_orders_tool,
             make_save_report_tool(run_id), make_create_purchase_order_tool(run_id)]
+
+
+def tool_output_saver(run_id: str):
+    """Store every tool call's full output in tool_calls (evidence for tool citations).
+    A failed write never breaks the run: the output is also kept in memory (tool_calls.remember)."""
+    def save(call_id: str, tool: str, arguments: dict, output) -> None:
+        try:
+            runs.save_tool_call(run_id, call_id, tool, arguments, output)
+        except Exception as e:
+            print(f"could not store tool call {call_id}: {type(e).__name__}: {e}")
+    return save
 
 
 def make_approver(run_id: str, trace: list[dict]):
@@ -113,7 +133,8 @@ def execute(req: RunRequest, on_event: Callable[[dict], None] | None = None) -> 
         result = run_agent(build_system_prompt(req.system_prompt or default_prompt),
                            tools_for_run(run_id, req.mode, emit), req.task,
                            output_schema=req.output_schema, on_event=on_step,
-                           run_id=run_id, approve=make_approver(run_id, trace))
+                           run_id=run_id, approve=make_approver(run_id, trace),
+                           on_tool_output=tool_output_saver(run_id))
     except Exception as e:
         runs.finish_run(run_id, "failed", trace, error=f"{type(e).__name__}: {e}",
                         duration_ms=int((time.monotonic() - started) * 1000))

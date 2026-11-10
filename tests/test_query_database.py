@@ -79,7 +79,7 @@ def test_system_prompt_survives_db_failure(monkeypatch):
     monkeypatch.setattr(service, "describe_schema", boom)
     monkeypatch.setattr(service, "describe_documents", boom)
     monkeypatch.setattr(service, "business_context", lambda: "")
-    assert service.build_system_prompt("Be brief.") == "Be brief."
+    assert service.build_system_prompt("Be brief.") == f"Be brief.\n\n{service.ANSWER_STYLE}"
 
 
 def test_run_tree_nests_children():
@@ -115,10 +115,17 @@ def test_review_snapshot_latest_wins_and_history_is_kept():
         latest = reviews.latest_reviews(run)
         assert latest[1]["decision"] == "accepted" and latest[1]["comment"] == "checked again"
         assert latest[2]["decision"] == "rejected"
-        tool_src = {"claim": "Order 40 units", "tool": "recommend_orders", "arguments": {"sku": "SKU009"}}
+        from app.agent import tool_calls
+        output = {"call_id": "rc-test01", "rows": [{"sku": "SKU009", "location_id": "L04", "next_order": {"qty": 40}}]}
+        runs.save_tool_call(run, "rc-test01", "recommend_orders", {"sku": "SKU009"}, output)
+        tool_calls._recent.pop("rc-test01", None)          # force the database lookup
+        tool_src = {"claim": "Order 40 units", "tool": "recommend_orders", "call_id": "rc-test01",
+                    "row": {"sku": "SKU009", "location_id": "L04"}, "fields": ["next_order.qty"]}
         tool_review = reviews.add_review(run, 3, tool_src, "accepted")
         assert (tool_review["source_kind"], tool_review["tool_name"], tool_review["tool_arguments"]) == \
             ("tool", "recommend_orders", {"sku": "SKU009"})
+        assert tool_review["tool_evidence"] == {"call_id": "rc-test01", "row": {"sku": "SKU009", "location_id": "L04"},
+                                                "fields": [{"field": "next_order.qty", "value": 40}]}
         with db.connect() as conn:
             assert conn.execute("select count(*) n from claim_reviews where run_id = %s", (run,)).fetchone()["n"] == 4
     finally:

@@ -33,9 +33,16 @@ ORCHESTRATOR_PROMPT = (
     "You can create purchase orders yourself with create_purchase_order (a human must approve each one), "
     "but only when the user asks you to place or create orders; use the quantities and dates the planner gave.\n"
     "Split the user's task into focused questions, delegate them (both at once when they are "
-    "independent), then combine the answers. Each specialist reports `chunks_found`, `sql_run` and `tools_run`: "
-    "cite those exact chunk_ids, SQL and tool calls (tool + arguments) in your sources. Never invent numbers or citations."
+    "independent), then combine the answers.\n"
+    "Each specialist answers with its own checked `sources`. For every claim you keep, copy the matching "
+    "specialist source into your sources (same tool, call_id, row and fields; or the same table and sql), "
+    "adjusting only the claim text. Each specialist also reports `sql_run` and `tools_run` (with call_ids). "
+    "Never invent numbers, call_ids or citations, and never cite ask_* tools: cite the underlying "
+    "recommend_orders call or SQL."
 )
+
+# Specialists answer in this shape, so their claims arrive already cited and checked
+SPECIALIST_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
 
 
 @dataclass
@@ -73,7 +80,9 @@ SPECIALISTS = [
 
 
 def make_delegation_tools(parent_run_id: str, emit: Callable[[dict], None],
-                          build_prompt: Callable[..., str]) -> list[Tool]:
+                          build_prompt: Callable[..., str],
+                          tool_output_saver: Callable[[str], Callable] | None = None) -> list[Tool]:
+    """tool_output_saver(child_run_id) -> on_tool_output callback that stores each call's full output."""
     """One ask_<specialist> tool per specialist, bound to this orchestrator run."""
     child_traces: dict[str, list] = {}  # child_run_id -> trace, picked up by trace_fields below
 
@@ -89,8 +98,9 @@ def make_delegation_tools(parent_run_id: str, emit: Callable[[dict], None],
 
             try:
                 prompt = build_prompt(spec.system_prompt, tables=spec.sees_tables, documents=spec.sees_documents)
-                result = run_agent(prompt, spec.tools, question,
-                                   on_event=forward, run_id=child_run_id)
+                result = run_agent(prompt, spec.tools, question, output_schema=SPECIALIST_SCHEMA,
+                                   on_event=forward, run_id=child_run_id,
+                                   on_tool_output=tool_output_saver(child_run_id) if tool_output_saver else None)
             except Exception as e:
                 runs.finish_run(child_run_id, "failed", [], error=f"{type(e).__name__}: {e}",
                                 duration_ms=int((time.monotonic() - started) * 1000))
@@ -107,8 +117,8 @@ def make_delegation_tools(parent_run_id: str, emit: Callable[[dict], None],
 
         return Tool(
             name=f"ask_{spec.name}",
-            description=spec.description + " Ask one focused question; you get back its answer, "
-                                           "chunks_found, sql_run and tools_run.",
+            description=spec.description + " Ask one focused question; you get back its answer "
+                                           "with cited sources, plus chunks_found, sql_run and tools_run.",
             input_schema={"type": "object",
                           "properties": {"question": {"type": "string", "description": "A self-contained question"}},
                           "required": ["question"]},

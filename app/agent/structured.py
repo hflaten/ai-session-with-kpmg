@@ -9,13 +9,19 @@ a document, database or tool citation:
 
     {"claim": "...", "document_name": "report.pdf", "page_number": 2, "chunk_id": "report.pdf:p2:c1"}
     {"claim": "...", "table": "sales_daily", "sql": "select ..."}
-    {"claim": "...", "tool": "recommend_orders", "arguments": {"location_id": "L01"}}
+    {"claim": "...", "tool": "recommend_orders", "call_id": "rc-3f9a1c",
+     "row": {"sku": "SKU009", "location_id": "L04"}, "fields": ["next_order.qty", "next_order.order_date"]}
 
 Citations are checked against what actually happened in this run (Evidence):
 a chunk_id must have been returned by search_documents (with matching document
 and page), and the sql must be a query_database call that succeeded, with the
-table appearing in it; a tool citation must match a successful call of a citable
-tool (CITABLE_TOOLS: deterministic calculations) with the same arguments.
+table appearing in it; a tool citation must name a call_id of a citable tool
+(CITABLE_TOOLS: deterministic calculations) that ran in this run. Those are hard errors.
+
+Tool citations are then checked against that call's stored output (evidence_errors):
+the row exists, the fields exist, and every number and date in the claim matches a
+cited value (numbers.py: rounding and "414k" / "46%" formatting allowed). These are soft
+errors: sent back to the model twice, then the answer is accepted with `warnings`.
 
 The answer text must also cite inline: "Oslo met the target [1], Bergen missed it [2]."
 [n] is the 1-based position in `sources`. Every marker must point to a source, every
@@ -28,11 +34,12 @@ carry a marker (unmarked_fact_errors).
 Invalid answers go back to the model to fix.
 """
 import copy
-import json
 import re
 
 from jsonschema import Draft202012Validator
 
+from app.agent import tool_calls
+from app.agent.numbers import claim_mismatches, flatten, strip_names
 from app.llm import Tool
 
 SUBMIT_TOOL_NAME = "submit_answer"
@@ -67,9 +74,18 @@ SOURCES_SCHEMA = {
                 "properties": {
                     "claim": {"type": "string"},
                     "tool": {"type": "string", "description": "A calculation tool you called, e.g. recommend_orders"},
-                    "arguments": {"type": "object", "description": "The exact arguments you called it with ({} if none)"},
+                    "call_id": {"type": "string", "description": "The call_id in that tool result, e.g. rc-3f9a1c"},
+                    "row": {
+                        "description": ('The row the numbers come from, by its keys, e.g. {"sku": "SKU009", '
+                                        '"location_id": "L04"}; or "summary" for the totals'),
+                        "anyOf": [{"type": "object", "additionalProperties": {"type": "string"}, "minProperties": 1},
+                                  {"const": "summary"}],
+                    },
+                    "fields": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                               "description": ("The fields holding every number and date in the claim, as dot paths, "
+                                               'e.g. ["next_order.qty", "without_recommendation.lost_sales_nok"]')},
                 },
-                "required": ["claim", "tool", "arguments"],
+                "required": ["claim", "tool", "call_id", "row", "fields"],
                 "additionalProperties": False,
             },
             {
@@ -112,7 +128,13 @@ def make_submit_tool(schema: dict) -> Tool:
                      "that match the schema. Do not answer in plain text. In `sources`, cite every factual "
                      "claim: chunks you got from search_documents (chunk_id, document_name, page_number), "
                      "the exact SQL you ran with query_database (table, sql), and/or a calculation tool you "
-                     "called such as recommend_orders (tool, arguments: exactly as you called it). In the answer text, "
+                     "called such as recommend_orders: give its call_id (from the tool result), the row (its keys, "
+                     "or \"summary\" for totals) and the fields that hold every number and date in the claim, e.g. "
+                     "{\"claim\": \"Order 40 units of Røkt laks 300 g for Høyden Nettbutikk by 6 Nov\", "
+                     "\"tool\": \"recommend_orders\", \"call_id\": \"rc-3f9a1c\", "
+                     "\"row\": {\"sku\": \"SKU009\", \"location_id\": \"L04\"}, "
+                     "\"fields\": [\"next_order.qty\", \"next_order.order_date\"]}. Every number in the claim must "
+                     "match a cited field (rounding like 414k or 46% is fine). In the answer text, "
                      "mark each claim inline with [n] = its 1-based position in `sources`, right after the "
                      "claim, e.g. \"Oslo met the target [1], Bergen missed it [2].\" Every source must be marked, "
                      "and each marker exactly once: one marker per claim. If two claims rest on the same evidence, "
@@ -137,11 +159,6 @@ def validation_errors(schema: dict, answer: dict) -> list[str]:
 CITABLE_TOOLS = {"recommend_orders"}   # deterministic tools whose results can back a claim
 
 
-def normalize_args(args: dict) -> str:
-    """Compare tool arguments ignoring key order and empty (null) values."""
-    return json.dumps({k: v for k, v in (args or {}).items() if v is not None and v != ""}, sort_keys=True)
-
-
 def normalize_sql(sql: str) -> str:
     """Compare queries ignoring whitespace, case and a trailing semicolon."""
     return re.sub(r"\s+", " ", sql).strip().rstrip(";").strip().lower()
@@ -157,23 +174,28 @@ class Evidence:
     def __init__(self) -> None:
         self.chunks: dict[str, dict] = {}   # chunk_id -> {document_name, page_number}
         self.sql: dict[str, str] = {}       # normalized SQL -> SQL as written, for successful queries
-        self.tools: dict[tuple[str, str], dict] = {}   # (tool, normalized args) -> args, for citable tools
+        self.tool_calls: dict[str, str] = {}   # call_id -> tool name, for citable tools (outputs: tool_calls.recall)
+        self.names: set[str] = set()           # names with digits seen in outputs ("Røkt laks 300 g")
 
-    def add(self, tool_name: str, args: dict, output) -> None:
+    def add(self, tool_name: str, args: dict, output, call_id: str | None = None) -> None:
+        self.names |= names_in(output)
         if tool_name == "search_documents":
             for r in output["results"]:
                 self.chunks[r["chunk_id"]] = {"document_name": r["document_name"], "page_number": r["page_number"]}
         elif tool_name == "query_database":
             self.sql[normalize_sql(args["sql"])] = args["sql"]
-        elif tool_name in CITABLE_TOOLS:
-            self.tools[(tool_name, normalize_args(args))] = args
+        elif tool_name in CITABLE_TOOLS and call_id:
+            self.tool_calls[call_id] = tool_name
         elif isinstance(output, dict) and "chunks_found" in output:  # a specialist's report
             for c in output["chunks_found"]:
                 self.chunks[c["chunk_id"]] = {"document_name": c["document_name"], "page_number": c["page_number"]}
             for sql in output["sql_run"]:
                 self.sql[normalize_sql(sql)] = sql
             for t in output.get("tools_run", []):
-                self.tools[(t["tool"], normalize_args(t["arguments"]))] = t["arguments"]
+                self.tool_calls[t["call_id"]] = t["tool"]
+                stored = tool_calls.recall(t["call_id"])
+                if stored:
+                    self.names |= names_in(stored["output"])
 
     def chunk_list(self) -> list[dict]:
         return [{"chunk_id": cid, **ref} for cid, ref in self.chunks.items()]
@@ -182,7 +204,21 @@ class Evidence:
         return list(self.sql.values())
 
     def tool_list(self) -> list[dict]:
-        return [{"tool": name, "arguments": args} for (name, _), args in self.tools.items()]
+        """[{tool, call_id, arguments}] - what a specialist reports to the orchestrator."""
+        out = []
+        for call_id, name in self.tool_calls.items():
+            stored = tool_calls.recall(call_id)
+            out.append({"tool": name, "call_id": call_id, "arguments": stored["arguments"] if stored else {}})
+        return out
+
+
+NAME_WITH_DIGITS = re.compile(r"^(?=.*[A-Za-zÆØÅæøå]{2})(?=.*\d)(?!\d{4}-\d{2}-\d{2}).*\s.*$")
+
+
+def names_in(output) -> set[str]:
+    """Product/place names that contain digits, e.g. "Røkt laks 300 g", from any tool output.
+    Used so the digits in names are not taken for facts or numbers."""
+    return {v for v in flatten(output) if isinstance(v, str) and len(v) <= 60 and NAME_WITH_DIGITS.match(v)}
 
 
 def _table_in_sql(table: str, sql: str) -> bool:
@@ -202,9 +238,12 @@ def citation_errors(sources: list[dict], evidence: Evidence) -> list[str]:
                 errors.append(f"{where}: chunk '{s['chunk_id']}' is from {seen['document_name']} "
                               f"page {seen['page_number']}, not {s['document_name']} page {s['page_number']}")
         elif "tool" in s:
-            if (s["tool"], normalize_args(s["arguments"])) not in evidence.tools:
-                errors.append(f"{where}: {s['tool']} was not called successfully with arguments "
-                              f"{normalize_args(s['arguments'])} in this run; copy the exact arguments you used")
+            ran = evidence.tool_calls.get(s["call_id"])
+            if ran is None:
+                errors.append(f"{where}: call_id '{s['call_id']}' is not a {s['tool']} call from this run; "
+                              f"use a call_id shown in a tool result (calls: {', '.join(evidence.tool_calls) or 'none'})")
+            elif ran != s["tool"]:
+                errors.append(f"{where}: call_id '{s['call_id']}' is a {ran} call, not {s['tool']}")
         elif "sql" in s:
             if normalize_sql(s["sql"]) not in evidence.sql:
                 errors.append(f"{where}: this sql was not run successfully with query_database in this run; "
@@ -254,18 +293,25 @@ def marker_errors(answer: dict) -> list[str]:
 # ---------- facts without a marker ----------
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")                 # "41.83" is not a sentence end
+NORWEGIAN_DATE = re.compile(r"\b(\d{1,2})\.(?=\s+(?:jan|feb|mar|apr|mai|jun|jul|aug|sep|okt|nov|des))", re.IGNORECASE)
+
+
+def _no_date_dots(text: str) -> str:
+    """"6. nov" -> "6 nov", so the dot in a Norwegian date is not read as the end of a sentence."""
+    return NORWEGIAN_DATE.sub(r"\1", text)
 LIST_PREFIX = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")          # "- " or "1. " list bullets
 
 
-def unmarked_fact_errors(answer: dict) -> list[str]:
+def unmarked_fact_errors(answer: dict, names=()) -> list[str]:
     """A sentence that contains a number, percentage or date must carry a marker.
 
     Catches claims whose marker sits after a later sentence ("Target is 45%. It is
     defined as ... [1]."), so every fact gets its own reviewable marker.
     Markdown headings are skipped; spelled-out numbers ("four") are not detected.
+    Digits inside `names` (e.g. "Røkt laks 300 g") don't count.
     """
     errors = []
-    for line in answer_text(answer).splitlines():
+    for line in _no_date_dots(strip_names(answer_text(answer), names)).splitlines():
         if line.lstrip().startswith("#"):
             continue
         for sentence in SENTENCE_END.split(LIST_PREFIX.sub("", line)):   # drop "1. " before splitting
@@ -277,4 +323,99 @@ def unmarked_fact_errors(answer: dict) -> list[str]:
                 errors.append(f'sentence "{shown}" contains a number, percentage or date but has no marker. '
                               "Make it its own claim: add an entry to sources and put [n] right after it, "
                               "or remove the number if you have no evidence for it")
+    return errors
+
+
+
+# ---------- tool evidence: row, fields, numbers (soft checks) ----------
+
+SUMMARY = "summary"
+
+
+def find_row(output, row) -> dict | None:
+    """The row a tool source points at: "summary" = the top level (totals etc.); otherwise the
+    first item, in any list of rows in the output, whose keys match (e.g. sku + location_id)."""
+    if not isinstance(output, dict):
+        return None
+    if row == SUMMARY:
+        return {k: v for k, v in output.items() if not (isinstance(v, list) and v and isinstance(v[0], dict))}
+    for value in output.values():
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and all(str(item.get(k)) == str(v) for k, v in row.items()):
+                    return item
+    return None
+
+
+MISSING = object()
+
+
+def get_field(row: dict, path: str):
+    """'next_order.qty' -> row["next_order"]["qty"]; MISSING if it isn't there."""
+    value = row
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return MISSING
+        value = value[part]
+    return value
+
+
+def cited_values(source: dict) -> tuple[dict | None, dict, list[str]]:
+    """(row, {field: value}, problems) for one tool source, from the call's stored output."""
+    stored = tool_calls.recall(source["call_id"])
+    if stored is None:
+        return None, {}, [f"call {source['call_id']} has no stored output"]
+    row = find_row(stored["output"], source["row"])
+    if row is None:
+        return None, {}, [f"row {source['row']} is not in the output of {source['call_id']}"]
+    values, problems = {}, []
+    for f in source["fields"]:
+        v = get_field(row, f)
+        if v is MISSING:
+            problems.append(f"field '{f}' does not exist in that row (it has: {', '.join(row)})")
+        else:
+            values[f] = v
+    return row, values, problems
+
+
+def claim_spans(text: str) -> list[tuple[str, list[int]]]:
+    """[(claim text, [markers])] - the text before each marker group, back to the sentence start.
+    The same split as splitClaims() in the frontend (LOVABLE.md)."""
+    text = _no_date_dots(text)
+    spans, last = [], 0
+    for m in re.finditer(r"(?:\[\d+\])+", text):
+        before = text[last:m.start()]
+        starts = [b.end() for b in re.finditer(r"[.!?](?=\s)\s*|\n", before)]
+        spans.append((before[starts[-1] if starts else 0:], [int(n) for n in re.findall(r"\d+", m.group(0))]))
+        last = m.end()
+    return spans
+
+
+def evidence_errors(answer: dict, evidence: Evidence) -> list[str]:
+    """Soft checks for tool sources. Hard checks (call_id ran) are in citation_errors."""
+    errors = []
+    sources = answer.get("sources", [])
+    resolved: dict[int, tuple[dict | None, dict]] = {}
+    for i, s in enumerate(sources):
+        if "tool" not in s or s["call_id"] not in evidence.tool_calls:
+            continue
+        row, values, problems = cited_values(s)
+        resolved[i + 1] = (row, values)
+        errors += [f"sources/{i}: {p}" for p in problems]
+        if row is not None:
+            bad = claim_mismatches(s["claim"], list(values.values()), evidence.names)
+            if bad:
+                errors.append(f"sources/{i}: the claim's {', '.join(bad)} do not match the cited fields "
+                              f"{values}; cite the field that holds it, or fix the number")
+
+    # The claim as written in the answer text (what the reviewer sees highlighted) must match too
+    for text, markers in claim_spans(answer_text(answer)):
+        if not markers or not all(m in resolved for m in markers):
+            continue      # not only tool sources (SQL / documents are checked differently)
+        values = [v for m in markers for v in resolved[m][1].values()]
+        bad = claim_mismatches(text, values, evidence.names)
+        if bad:
+            shown = text.strip()[:90]
+            errors.append(f'claim "{shown}" {"".join(f"[{m}]" for m in markers)}: {", ".join(bad)} '
+                          "not found in the cited fields; cite the field that holds it, or fix the number")
     return errors

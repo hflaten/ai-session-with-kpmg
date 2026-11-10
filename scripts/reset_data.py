@@ -2,7 +2,7 @@
 
 Always: drop every uploaded/demo table (including sample_sales), empty
 document_chunks, saved_reports, claim_reviews and proposed_orders. With --include-runs: also empty
-agent_runs (the run log). The tables themselves, the read-only role and all
+agent_runs (the run log) and tool_calls (full tool outputs per run). The tables themselves, the read-only role and all
 other schema are kept.
 
     .venv/bin/python -m scripts.reset_data                          # dry run: shows what would be deleted
@@ -19,7 +19,7 @@ from psycopg import sql
 
 from app import db
 
-KEEP = {"agent_runs", "document_chunks", "saved_reports", "claim_reviews", "proposed_orders"}  # the backend's own tables (emptied, not dropped)
+KEEP = {"agent_runs", "tool_calls", "document_chunks", "saved_reports", "claim_reviews", "proposed_orders"}  # the backend's own tables (emptied, not dropped)
 
 
 def count(conn, table: str) -> int:
@@ -36,7 +36,7 @@ def tables_to_drop(conn) -> list[str]:
 def main() -> int:
     really = "--yes" in sys.argv
     include_runs = "--include-runs" in sys.argv
-    to_empty = ["document_chunks", "saved_reports", "claim_reviews", "proposed_orders"] + (["agent_runs"] if include_runs else [])
+    to_empty = ["document_chunks", "saved_reports", "claim_reviews", "proposed_orders"] + (["agent_runs", "tool_calls"] if include_runs else [])
 
     with db.connect() as conn:  # one transaction: all or nothing
         to_drop = tables_to_drop(conn)

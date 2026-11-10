@@ -14,24 +14,33 @@ from psycopg.types.json import Jsonb
 from app import db
 
 COLUMNS = ("id, created_at, marker, decision, reviewer, comment, claim, source_kind, "
-           "document_name, page_number, chunk_id, table_name, sql_query, tool_name, tool_arguments")
+           "document_name, page_number, chunk_id, table_name, sql_query, tool_name, tool_arguments, tool_evidence")
 
 
 def add_review(run_id: str, marker: int, source: dict, decision: str,
                reviewer: str | None = None, comment: str | None = None) -> dict:
     """source = answer.sources[marker - 1]; its claim and reference are copied into the review."""
     kind = "document" if "chunk_id" in source else ("tool" if "tool" in source else "database")
+    tool_arguments = tool_evidence = None
+    if kind == "tool":   # snapshot the pointer and the cited values, as they were when reviewed
+        from app.agent import tool_calls
+        from app.agent.structured import cited_values
+        stored = tool_calls.recall(source["call_id"])
+        _, values, _ = cited_values(source)
+        tool_arguments = Jsonb(stored["arguments"]) if stored else None
+        tool_evidence = Jsonb({"call_id": source["call_id"], "row": source["row"],
+                               "fields": [{"field": f, "value": v} for f, v in values.items()]})
     with db.connect() as conn:
         return conn.execute(
             f"""insert into claim_reviews
                     (run_id, source_index, decision, reviewer, comment, claim, source_kind,
-                     document_name, page_number, chunk_id, table_name, sql_query, tool_name, tool_arguments)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     document_name, page_number, chunk_id, table_name, sql_query, tool_name, tool_arguments,
+                     tool_evidence)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 returning {COLUMNS}""",
             (run_id, marker - 1, decision, reviewer, comment, source.get("claim"),
              kind, source.get("document_name"), source.get("page_number"), source.get("chunk_id"),
-             source.get("table"), source.get("sql"), source.get("tool"),
-             Jsonb(source["arguments"]) if "arguments" in source else None),
+             source.get("table"), source.get("sql"), source.get("tool"), tool_arguments, tool_evidence),
         ).fetchone()
 
 

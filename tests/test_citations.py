@@ -231,28 +231,149 @@ def test_unmarked_fact_is_sent_back_then_fixed(monkeypatch):
     assert r.answer["answer"].startswith("The target is 45% [1].")
 
 
-# ---------- tool sources (deterministic calculations) ----------
+# ---------- tool sources: call_id + row + fields, numbers checked ----------
 
-TOOL_SOURCE = {"claim": "Order 40 units of salmon", "tool": "recommend_orders", "arguments": {"sku": "SKU009"}}
+from app.agent import tool_calls
+from app.agent.structured import evidence_errors
+
+PLAN_OUTPUT = {
+    "call_id": "rc-aaaaaa", "today": "2026-11-06", "horizon_days": 56,
+    "totals": {"without_recommendation": {"lost_sales_nok": 414493}, "with_recommendation": {"lost_sales_nok": 9745}},
+    "rows": [{"sku": "SKU009", "location_id": "L04", "product": "Røkt laks 300 g", "location": "Høyden Nettbutikk",
+              "next_order": {"order_date": "2026-11-06", "arrival_date": "2026-11-08", "qty": 40},
+              "stockout_risk_date": "2026-11-11", "why": {"trend": 1.091}}],
+}
+ROW = {"sku": "SKU009", "location_id": "L04"}
 
 
-def test_tool_source_must_match_a_call_with_the_same_arguments():
+def tool_source(claim, fields, row=ROW, call_id="rc-aaaaaa"):
+    return {"claim": claim, "tool": "recommend_orders", "call_id": call_id, "row": row, "fields": fields}
+
+
+def plan_evidence() -> Evidence:
+    tool_calls.remember("rc-aaaaaa", "recommend_orders", {}, PLAN_OUTPUT)
     e = Evidence()
-    e.add("recommend_orders", {"sku": "SKU009", "location_id": None}, {"rows": []})
-    assert citation_errors([TOOL_SOURCE], e) == []
-    wrong = {**TOOL_SOURCE, "arguments": {"sku": "SKU001"}}
-    assert "was not called successfully" in citation_errors([wrong], e)[0]
-    assert "was not called successfully" in citation_errors([TOOL_SOURCE], Evidence())[0]
+    e.add("recommend_orders", {}, PLAN_OUTPUT, call_id="rc-aaaaaa")
+    return e
+
+
+def answer(text, *sources):
+    return {"answer": text, "sources": list(sources)}
+
+
+def test_good_tool_citation_passes_all_checks():
+    s = tool_source("Order 40 units of Røkt laks 300 g by 6 Nov", ["next_order.qty", "next_order.order_date"])
+    a = answer("Order 40 units of Røkt laks 300 g for Høyden Nettbutikk today, 6 Nov [1].", s)
+    e = plan_evidence()
+    assert citation_errors(a["sources"], e) == [] and evidence_errors(a, e) == []
+    assert unmarked_fact_errors(answer("**Røkt laks 300 g**"), e.names) == []   # digits in a name are not facts
+
+
+def test_summary_row_rounding_and_differences():
+    s = tool_source("Lost sales fall from NOK 414k to NOK 9.7k, saving about NOK 405k",
+                    ["totals.without_recommendation.lost_sales_nok", "totals.with_recommendation.lost_sales_nok"],
+                    row="summary")
+    assert evidence_errors(answer("Lost sales fall from 414,493 NOK to NOK 10k [1].", s), plan_evidence()) == []
+
+
+def test_unknown_call_id_is_a_hard_error():
+    s = tool_source("Order 40", ["next_order.qty"], call_id="rc-ffffff")
+    assert "is not a recommend_orders call from this run" in citation_errors([s], plan_evidence())[0]
+
+
+@pytest.mark.parametrize("source, text, message", [
+    (tool_source("Order 40", ["next_order.qty"], row={"sku": "SKU001", "location_id": "L04"}), "Order 40 [1].",
+     "is not in the output"),
+    (tool_source("Order 40", ["next_order.quantity"]), "Order 40 [1].", "field 'next_order.quantity' does not exist"),
+    (tool_source("Order 400 units", ["next_order.qty"]), "Order 40 [1].", 'number "400"'),       # wrong in sources
+    (tool_source("Order 40 units", ["next_order.qty"]), "Order 400 units [1].", 'number "400"'),  # wrong in the text
+    (tool_source("Arrives 9 Nov", ["next_order.arrival_date"]), "Arrives 8 Nov [1].", 'date "9 Nov"'),
+    (tool_source("Order 40, demand up 9%", ["next_order.qty"]), "Order 40 [1].", 'number "9%"'),   # trend not cited
+])
+def test_wrong_rows_fields_numbers_and_dates_are_caught(source, text, message):
+    errors = evidence_errors(answer(text, source), plan_evidence())
+    assert errors and any(message in e for e in errors), errors
+
+
+def test_percent_change_from_a_factor():
+    s = tool_source("Demand is 9% above last year", ["why.trend"])
+    assert evidence_errors(answer("Demand is 9% above last year [1].", s), plan_evidence()) == []
 
 
 def test_tool_source_passes_the_schema():
     from app.agent.structured import validation_errors
     schema = with_sources({"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]})
-    assert validation_errors(schema, {"answer": "x [1]", "sources": [TOOL_SOURCE]}) == []
+    good = tool_source("Order 40", ["next_order.qty"])
+    assert validation_errors(schema, {"answer": "x [1]", "sources": [good]}) == []
+    assert validation_errors(schema, {"answer": "x [1]", "sources": [tool_source("x", [], row="summary")]})  # no fields
 
 
 def test_specialist_tool_calls_are_evidence_for_the_orchestrator():
+    tool_calls.remember("rc-bbbbbb", "recommend_orders", {"sku": "SKU009"}, {**PLAN_OUTPUT, "call_id": "rc-bbbbbb"})
     e = Evidence()
-    e.add("ask_data_analyst", {"question": "q"}, {"answer": "a", "chunks_found": [], "sql_run": [],
-                                                   "tools_run": [{"tool": "recommend_orders", "arguments": {"sku": "SKU009"}}]})
-    assert citation_errors([TOOL_SOURCE], e) == []
+    e.add("ask_inventory_planner", {"question": "q"}, {"answer": "a", "chunks_found": [], "sql_run": [],
+          "tools_run": [{"tool": "recommend_orders", "call_id": "rc-bbbbbb", "arguments": {"sku": "SKU009"}}]})
+    s = tool_source("Order 40 units of Røkt laks 300 g", ["next_order.qty"], call_id="rc-bbbbbb")
+    a = answer("Order 40 units of Røkt laks 300 g [1].", s)
+    assert citation_errors(a["sources"], e) == [] and evidence_errors(a, e) == []
+
+
+# ---------- in the loop: wrong numbers go back twice, then accepted with warnings ----------
+
+FAKE_PLAN = Tool("recommend_orders", "plan", {"type": "object", "properties": {}},
+                 run=lambda: {k: v for k, v in PLAN_OUTPUT.items() if k != "call_id"})
+
+
+def plan_then_submit(monkeypatch, claim_texts):
+    """LLM: call recommend_orders, then submit each answer text in turn (citing next_order.qty)."""
+    seen = []
+
+    def fake(system, messages, tools, force_tool=None):
+        seen.append(messages[-1])
+        results = [m for m in messages if m["role"] == "tool" and m["name"] == "recommend_orders"]
+        if not results:
+            return LLMResponse("", [ToolCall("p", "recommend_orders", {})])
+        import json
+        call_id = json.loads(results[0]["content"])["call_id"]
+        text = claim_texts[min(len(seen) - 2, len(claim_texts) - 1)]
+        source = tool_source(text, ["next_order.qty"], call_id=call_id)
+        return LLMResponse("", [ToolCall(f"s{len(seen)}", "submit_answer", {"answer": f"{text} [1].", "sources": [source]})])
+    monkeypatch.setattr(loop, "call_llm", fake)
+    return seen
+
+
+def test_wrong_number_is_sent_back_then_fixed(monkeypatch):
+    seen = plan_then_submit(monkeypatch, ["Order 400 units", "Order 40 units"])
+    r = loop.run_agent("sys", [FAKE_PLAN], "q", output_schema=SCHEMA)
+    assert 'number "400"' in seen[2]["content"]
+    assert r.answer["answer"] == "Order 40 units [1]." and "warnings" not in r.answer
+    assert r.trace[1]["call_id"].startswith("rc-")                      # every tool call gets a call_id
+
+
+def test_wrong_number_twice_then_accepted_with_warnings(monkeypatch):
+    plan_then_submit(monkeypatch, ["Order 400 units"])                   # never fixed
+    r = loop.run_agent("sys", [FAKE_PLAN], "q", output_schema=SCHEMA)
+    finals = [e for e in r.trace if e["type"] == "final_answer"]
+    assert [e["valid"] for e in finals] == [False, False, True]
+    assert r.stopped_reason == "answered"
+    assert r.answer["warnings"] and 'number "400"' in r.answer["warnings"][0]
+    assert finals[-1]["warnings"] == r.answer["warnings"]
+
+
+def test_full_tool_output_is_handed_over_for_storage(monkeypatch):
+    stored = []
+    plan_then_submit(monkeypatch, ["Order 40 units"])
+    loop.run_agent("sys", [FAKE_PLAN], "q", output_schema=SCHEMA,
+                   on_tool_output=lambda call_id, tool, args, output: stored.append((call_id, tool, output)))
+    (call_id, tool, output), = stored
+    assert tool == "recommend_orders" and output["call_id"] == call_id and output["rows"][0]["next_order"]["qty"] == 40
+
+
+def test_rounded_thousands_and_norwegian_dates():
+    from app.agent.numbers import claim_mismatches
+    assert claim_mismatches("about NOK 49,000 at risk", [49235]) == []
+    assert claim_mismatches("from 414,000 to 9,700", [414493, 9745]) == []
+    assert claim_mismatches("order 40", [44]) == ['number "40"']           # small numbers stay exact
+    assert claim_mismatches("bestill innen 6. nov", ["2026-11-06"]) == []
+    text = "Røkt laks 300 g: bestill 40 stk 6. nov [1]."
+    assert unmarked_fact_errors({"answer": text, "sources": []}, {"Røkt laks 300 g"}) == []   # one sentence, marked

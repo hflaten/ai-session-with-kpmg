@@ -22,7 +22,7 @@ from psycopg import sql
 from app import db
 from app.ingest.table_layout import clean_sheet, read_tidy_csv
 
-RESERVED_TABLES = {"agent_runs", "document_chunks", "saved_reports", "claim_reviews", "proposed_orders"}  # never overwrite the backend's own tables
+RESERVED_TABLES = {"agent_runs", "tool_calls", "document_chunks", "saved_reports", "claim_reviews", "proposed_orders"}  # never overwrite the backend's own tables
 MAX_IDENTIFIER = 63                                   # Postgres name length limit
 
 

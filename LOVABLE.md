@@ -134,7 +134,7 @@ Every entry has `step`, `type` and `agent` (`agent`, `orchestrator`, `data_analy
 | `type` | Fields | Display |
 |---|---|---|
 | `llm` | `text`, `tool_calls: [{name, input}]`, `tokens`, `ms` | "Thinking… → calls query_database" |
-| `tool` | `tool`, `input`, `output` (string, max 2000 chars), `error`, `ms`, `parallel` (ran at the same time as other calls); `chunk_ids` for `search_documents`; `specialist`, `child_run_id`, `child_trace` for delegations | tool name + input (show `input.sql` as code, `input.query` as text) |
+| `tool` | `tool`, `input`, `output` (string, max 2000 chars), `error`, `ms`, `parallel` (ran at the same time as other calls); `chunk_ids` for `search_documents`; `specialist`, `child_run_id`, `child_trace` for delegations; `call_id` (e.g. `rc-3f9a1c`, the id tool sources cite) | tool name + input (show `input.sql` as code, `input.query` as text) |
 | `approval` | `tool`, `decision` (`approved` \| `rejected` \| `timeout`), `reason`, `waited_ms` | the human decision |
 | `final_answer` | `input`, `valid`, `errors` | if `valid` is false: "answer rejected, retrying" + `errors` |
 | `delegation_started` | `specialist`, `child_run_id`, `question` | orchestrator mode: "Asking data_analyst: …"; that specialist's own steps follow (with their own `agent` and `run_id`) |
@@ -166,12 +166,18 @@ Three kinds of source — tell them apart by which key exists:
 
 - **Document**: has `chunk_id` → `{claim, document_name, page_number, chunk_id}`
 - **Database**: has `sql` → `{claim, table, sql}`
-- **Tool**: has `tool` → `{claim, tool, arguments}` — a deterministic calculation, e.g.
-  `{"tool": "recommend_orders", "arguments": {"location_id": "L01"}}`
+- **Tool**: has `tool` → `{claim, tool, call_id, row, fields}` — a value from a deterministic
+  calculation, pointing at the exact call, row and fields, e.g.
+  `{"tool": "recommend_orders", "call_id": "rc-3f9a1c", "row": {"sku": "SKU009", "location_id": "L04"},
+  "fields": ["next_order.qty", "next_order.order_date"]}`. `row` is `"summary"` for totals.
 
 The backend has already checked that every cited chunk was really found by a search in this
-run (same document and page), every SQL really ran, and every tool really ran with those
-arguments. One claim can have several entries.
+run (same document and page), every SQL really ran, and every tool `call_id` really ran.
+For tool sources it also checked that the row and fields exist in that call's stored output and
+that **every number and date in the claim matches a cited value** (rounding like "414k" or "46%"
+is allowed). If the model still got a number wrong after two corrections, the answer is accepted
+with a **`warnings`** list (strings) next to `sources`: show them in an amber box above the answer.
+One claim can have several entries.
 
 ### Inline markers `[n]` — one marker = one claim
 
@@ -257,8 +263,24 @@ the inline `marker` (`index + 1`) and the latest human `review` (section 8):
 
 - `document` → show `text` (the original page text) with "document_name — page N".
 - `database` → show `rows` as a table with `columns` as headers, plus the `sql` (collapsible).
-- `tool` → show "Calculated by {tool}" with the `arguments`, and `result` (the tool's output,
-  re-run now) as collapsible JSON; for `recommend_orders`, `result.rows` is a table-friendly list.
+- `tool` → the **source sheet** (see the prompt at the end). Extra fields on a tool source:
+
+```json
+{"index": 0, "marker": 1, "kind": "tool", "claim": "Order 40 units of Røkt laks 300 g ...",
+ "tool": "recommend_orders", "call_id": "rc-3f9a1c", "arguments": {},
+ "row": {"sku": "SKU009", "location_id": "L04"}, "fields": ["next_order.qty", "next_order.order_date"],
+ "product": "Røkt laks 300 g", "location": "Høyden Nettbutikk",
+ "cited_fields": [{"field": "next_order.qty", "value": 40}, {"field": "next_order.order_date", "value": "2026-11-06"}],
+ "why": {"forecast_basis": "same days last year, stockout-corrected, x trend", "trend": 1.091,
+         "last_8_weeks_units": 675, "same_8_weeks_last_year_units": 618, "forecast_daily_avg": 19.92,
+         "lead_time_days": 2, "lead_time_sd_days": 1, "on_hand": 0, "on_order": 70, "shelf_life_days": 14,
+         "planned_promotions": [{"start": "2026-12-01", "end": "2026-12-10"}]},
+ "row_data": {"...": "the whole row as the tool returned it"},
+ "method": null, "error": null, "review": null}
+```
+
+  The evidence is the call's **stored** output (not re-run), so it shows exactly what the agent saw.
+  For `row: "summary"`, `product`/`location`/`why` are null and `method` explains the totals.
 - `error` is non-null if the evidence is gone (e.g. data was reset) — show it instead.
 
 ## 6. Human-in-the-loop: approve / reject
@@ -316,14 +338,14 @@ await fetch(`${BACKEND_URL}/runs/${runId}/claims/${marker}/review`, {   // marke
 });
 // -> { run_id, marker, review: { id, created_at, marker, decision, reviewer, comment,
 //      claim, source_kind, document_name, page_number, chunk_id, table_name, sql_query,
-//      tool_name, tool_arguments } }
+//      tool_name, tool_arguments, tool_evidence: {call_id, row, fields: [{field, value}]} } }
 ```
 
 - **One numbering:** the URL takes the marker number, 1-based, exactly as written in the text.
   `[3]` → `/claims/3/review`. (`index` in `/sources` is only the 0-based list position.)
 - `decision`: `"accepted"` or `"rejected"`; `reviewer` and `comment` are optional.
 - Each review stores a **snapshot** of the claim text and its reference (document + page + chunk,
-  table + SQL, or tool + arguments), so the audit record stands on its own even if the run changes later.
+  table + SQL, or tool call + row + the cited values), so the audit record stands on its own even if the run changes later.
 - Reviewing again adds a new review; the newest is the current decision (`/sources` returns it as
   `review`). History is kept in the database.
 - `GET /runs/{run_id}/sources` → `summary: {total, accepted, rejected, unreviewed}`; `total` is the
@@ -658,13 +680,56 @@ LAYOUT
    Days of cover ("no expected demand" if null), Stock value (inputs.on_hand_units × inputs.unit_cost_nok),
    Capital releasable (bold). Small note: "More than 6 weeks of cover. Releasable = stock above 6 weeks."
 
-In the chat tab, sources can now also be a third kind with a `tool` key: {claim, tool, arguments}.
-Show it as "Calculated by {tool}" with the arguments; in GET /runs/{id}/sources such a source has
-`kind: "tool"` and `result` (show as collapsible JSON). Approval requests can now also be for the tool
+In the chat tab, sources can now also be a third kind with a `tool` key (kind "tool" in
+GET /runs/{id}/sources); see the separate "source sheet" prompt for how to show them. Approval requests can now also be for the tool
 create_purchase_order (input: sku, location_id, qty, order_date, reason): show these fields in the
 approval card.
 
 Check: the Dashboard shows four KPI cards with numbers, about 30 recommendation rows with smoked
 salmon (Røkt laks) near the top, and an overstock list with balsamico and flaky salt. Approving a row
 turns its buttons into an "Approved" badge that stays after Refresh.
+````
+
+
+## Ready-to-paste prompt: source sheet for tool citations
+
+Paste into the existing Lovable project (after the citations/claim-review prompt).
+
+````text
+Update how cited sources are shown in the chat (keep everything else). Do not invent fields.
+
+1. Answer warnings: a structured answer may have `warnings` (array of strings) next to `sources`.
+   If present and non-empty, show an amber box above the answer: "Some numbers could not be verified"
+   with the warnings as a list.
+
+2. Tool sources: in GET {BACKEND_URL}/runs/{run_id}/sources, a source with kind "tool" has:
+   claim, tool, call_id, arguments, row ({sku, location_id} or the string "summary"), fields (array of
+   field paths), product, location (names, may be null), cited_fields ([{field, value}]),
+   why (object or null), row_data (the whole row object), method (string or null), error (string or null),
+   marker, review.
+   When the user clicks a highlighted claim (or its [n]) whose source is kind "tool", open a right-side
+   sheet ("Source [n]") instead of the document/SQL view:
+   - Title: product and location ("Røkt laks 300 g · Høyden Nettbutikk"); for row "summary" use
+     "Plan totals". Subtitle: "Calculated by {tool} · call {call_id}" in small grey monospace.
+   - The claim text in a quote block.
+   - "Cited values": a two-column table of cited_fields (field → value). Make field paths readable:
+     "next_order.qty" → "Next order · qty"; values: numbers with space thousands separators, ISO dates as
+     "6 Nov 2026", NOK fields (name ends with _nok) as "NOK 49 235". These rows are highlighted (yellow
+     background, bold) — they are the evidence.
+   - "Why": a definition list from `why` with friendly labels: forecast_basis "Forecast basis",
+     trend "Trend vs last year" (show as "+9.1 %" from 1.091), last_8_weeks_units vs same_8_weeks_last_year_units
+     "Last 8 weeks vs same weeks last year", forecast_daily_avg "Forecast per day", lead_time_days ± lead_time_sd_days
+     "Lead time (days)", on_hand "In stock", on_order "On order", shelf_life_days "Shelf life (days)",
+     planned_promotions "Planned promotions" (start–end dates). Skip missing keys. For "summary" show
+     `method` as a paragraph instead.
+   - "Full row" (collapsed by default): row_data as a key/value table; fields listed in `fields` are
+     highlighted the same way as above (nested objects shown as "parent · child").
+   - If `error` is set, show it in red instead of the tables.
+   - At the bottom: the existing Accept / Reject buttons for this claim (POST
+     /runs/{run_id}/claims/{marker}/review), showing the current review if there is one.
+3. In the sources list under the answer, tool sources show a 🧮 icon with "{product} · {location}"
+   (or "Plan totals") and the first cited value, e.g. "Next order · qty: 40".
+
+Check: ask "What should we order for Christmas?". Clicking a salmon claim opens the sheet with
+product + location, the cited values highlighted (e.g. qty 40), and the Why list with the trend and lead time.
 ````

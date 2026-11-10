@@ -100,3 +100,22 @@ def test_review_a_claim_by_its_marker(review_api):
 def test_bad_reviews_are_refused(review_api, path, body, status):
     assert client.post(path, json=body).status_code == status
     assert review_api == []
+
+
+def test_tool_source_resolves_the_cited_row_with_names_fields_and_why(monkeypatch):
+    from app.agent import tool_calls
+    from app.sources import resolve_tool_source
+    output = {"call_id": "rc-sheet1", "method": "m", "rows": [{
+        "sku": "SKU009", "location_id": "L04", "product": "Røkt laks 300 g", "location": "Høyden Nettbutikk",
+        "next_order": {"qty": 40, "order_date": "2026-11-06"},
+        "why": {"forecast_basis": "same days last year", "trend": 1.09, "lead_time_days": 2, "on_hand": 0, "pack_size": 10}}]}
+    tool_calls.remember("rc-sheet1", "recommend_orders", {"sku": "SKU009"}, output)
+    r = resolve_tool_source({"claim": "Order 40", "tool": "recommend_orders", "call_id": "rc-sheet1",
+                             "row": {"sku": "SKU009", "location_id": "L04"}, "fields": ["next_order.qty"]})
+    assert (r["product"], r["location"], r["error"]) == ("Røkt laks 300 g", "Høyden Nettbutikk", None)
+    assert r["cited_fields"] == [{"field": "next_order.qty", "value": 40}]
+    assert r["why"] == {"forecast_basis": "same days last year", "trend": 1.09, "lead_time_days": 2, "on_hand": 0}
+    assert r["arguments"] == {"sku": "SKU009"} and r["row_data"]["next_order"]["order_date"] == "2026-11-06"
+    missing = resolve_tool_source({"claim": "x", "tool": "recommend_orders", "call_id": "rc-gone00",
+                                   "row": "summary", "fields": ["x"]})
+    assert missing["error"] and missing["row_data"] is None

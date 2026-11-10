@@ -10,7 +10,13 @@ Every LLM call and tool call is recorded in result.trace.
 With output_schema, the final answer must come through the submit_answer tool
 (see structured.py). It is validated against the schema, it always contains a
 `sources` list, and every source is checked against what the agent actually
-found in this run.
+found in this run. Tool citations are also checked against the cited call's stored
+output (row, fields, numbers); those mismatches are sent back twice, then the answer
+is accepted with a `warnings` list.
+
+Every tool call gets a call_id ("rc-3f9a1c"). Citable tools see it in their result, so
+the model can cite it; the full output is kept (tool_calls.remember) and handed to
+on_tool_output (service.py stores it in the tool_calls table).
 
 Tools with requires_approval=True pause the run: the loop records an
 `approval_required` entry, calls approve(call) (which blocks until a human
@@ -26,12 +32,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from app.agent.structured import (SUBMIT_TOOL_NAME, Evidence, citation_errors, make_submit_tool,
-                                  marker_errors, unmarked_fact_errors, validation_errors, with_sources)
+from app.agent import tool_calls
+from app.agent.structured import (CITABLE_TOOLS, SUBMIT_TOOL_NAME, Evidence, citation_errors, evidence_errors,
+                                  make_submit_tool, marker_errors, unmarked_fact_errors, validation_errors,
+                                  with_sources)
 from app.llm import Tool, ToolCall, call_llm
 
 MAX_TOOL_OUTPUT_CHARS = 20_000   # what the LLM sees from one tool call
-MAX_TRACE_OUTPUT_CHARS = 2_000   # what the trace keeps (readability)
+MAX_TRACE_OUTPUT_CHARS = 2_000   # what the trace keeps (readability); full outputs go to tool_calls
+MAX_SOFT_REJECTIONS = 2          # tool-evidence mismatches: send back twice, then accept with warnings
 
 
 # Two-phase approval, so a fast "approve" click can never arrive before we're listening:
@@ -91,7 +100,8 @@ def _run_in_parallel(calls: list[ToolCall], tools_by_name: dict[str, Tool]) -> d
 def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int = 10,
               output_schema: dict | None = None,
               on_event: Callable[[dict], None] | None = None,
-              run_id: str | None = None, approve: Approver | None = None) -> AgentResult:
+              run_id: str | None = None, approve: Approver | None = None,
+              on_tool_output: Callable[[str, str, dict, Any], None] | None = None) -> AgentResult:
     tools = list(tools)
     if output_schema:
         output_schema = with_sources(output_schema)  # every structured answer cites its sources
@@ -102,6 +112,7 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
     trace: list[dict] = []
     evidence = Evidence()  # chunks found and SQL run, for checking citations
     force_tool = None      # set when the model must call submit_answer next
+    soft_rejections = 0    # answers sent back only for tool-evidence mismatches
 
     def record(entry: dict) -> None:
         trace.append(entry)
@@ -140,13 +151,21 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
                 errors = validation_errors(output_schema, call.input)
                 if not errors:
                     errors = (citation_errors(call.input["sources"], evidence) + marker_errors(call.input)
-                              + unmarked_fact_errors(call.input))
-                record({"step": step, "type": "final_answer", "input": call.input, "valid": not errors,
-                        "errors": errors, "ms": int((time.monotonic() - started) * 1000)})
+                              + unmarked_fact_errors(call.input, evidence.names))
+                soft = [] if errors else evidence_errors(call.input, evidence)
+                accept_with_warnings = bool(soft) and soft_rejections >= MAX_SOFT_REJECTIONS
+                valid = not errors and (not soft or accept_with_warnings)
+                record({"step": step, "type": "final_answer", "input": call.input, "valid": valid,
+                        "errors": errors + ([] if accept_with_warnings else soft),
+                        "warnings": soft if accept_with_warnings else [],
+                        "ms": int((time.monotonic() - started) * 1000)})
+                if valid:
+                    answer = {**call.input, "warnings": soft} if accept_with_warnings else call.input
+                    return AgentResult(answer=answer, trace=trace, evidence=evidence)
                 if not errors:
-                    return AgentResult(answer=call.input, trace=trace, evidence=evidence)
+                    soft_rejections += 1
                 output_text = ("Your answer was rejected. Fix these and call submit_answer again:\n"
-                               + "\n".join(errors))
+                               + "\n".join(errors + soft))
             else:
                 tool = tools_by_name.get(call.name)
 
@@ -166,11 +185,17 @@ def run_agent(system_prompt: str, tools: list[Tool], task: str, max_steps: int =
                     else:
                         output, error = _run_tool(tool, call.name, call.input)
                         ms = int((time.monotonic() - started) * 1000)
+                    call_id = tool_calls.new_call_id()
+                    if error is None and call.name in CITABLE_TOOLS and isinstance(output, dict):
+                        output = {"call_id": call_id, **output}     # so the model can cite this call
                     output_text = _to_text(output)
                     entry = {"step": step, "type": "tool", "tool": call.name, "input": call.input,
-                             "parallel": call.id in prerun}
+                             "call_id": call_id, "parallel": call.id in prerun}
                     if error is None:
-                        evidence.add(call.name, call.input, output)
+                        tool_calls.remember(call_id, call.name, call.input, output)
+                        if on_tool_output:
+                            on_tool_output(call_id, call.name, call.input, output)
+                        evidence.add(call.name, call.input, output, call_id)
                         if tool.trace_fields:
                             entry.update(tool.trace_fields(output))  # e.g. chunk_ids for search_documents
                     entry.update({"output": _clip(output_text, MAX_TRACE_OUTPUT_CHARS), "error": error, "ms": ms})

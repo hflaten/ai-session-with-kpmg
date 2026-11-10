@@ -4,7 +4,7 @@ recommend_orders       deterministic order plan (app/inventory/planner.py), no L
 create_purchase_order  writes to proposed_orders; needs human approval first (like save_report)
 """
 import time
-from datetime import date
+from datetime import date, timedelta
 
 from app import db
 from app.inventory import data
@@ -31,6 +31,17 @@ def clear_cache() -> None:
     _cache.clear()
 
 
+def promo_periods(days: list[str]) -> list[dict]:
+    """["2026-12-01", ..., "2026-12-10"] -> [{"start": "2026-12-01", "end": "2026-12-10"}]"""
+    periods = []
+    for d in sorted(days):
+        if periods and date.fromisoformat(d) == date.fromisoformat(periods[-1]["end"]) + timedelta(days=1):
+            periods[-1]["end"] = d
+        else:
+            periods.append({"start": d, "end": d})
+    return periods
+
+
 def compact(row: dict) -> dict:
     """What the agent needs from one planner row (the dashboard gets the full row with all inputs)."""
     i = row["inputs"]
@@ -44,9 +55,15 @@ def compact(row: dict) -> dict:
         "with_recommendation": row["with_recommendation"], "without_recommendation": row["without_recommendation"],
         "overstock": row["overstock"], "capital_releasable_nok": row["capital_releasable_nok"],
         "nok_impact": row["nok_impact"],
-        "why": {"on_hand": i["on_hand_units"], "on_order": i["on_order_units"], "trend": i["trend_factor"],
-                "forecast_weekly_units": i["forecast_weekly_units"], "lead_time_days": i["lead_time_days_avg"],
-                "shelf_life_days": i["shelf_life_days"], "planned_promo_days": len(i["planned_promo_days"])},
+        "why": {"forecast_basis": "same days last year, stockout-corrected, x trend",
+                "trend": i["trend_factor"], "last_8_weeks_units": i["last_8_weeks_units"],
+                "same_8_weeks_last_year_units": i["same_8_weeks_last_year_units"],
+                "forecast_weekly_units": i["forecast_weekly_units"], "forecast_daily_avg": i["forecast_daily_avg"],
+                "on_hand": i["on_hand_units"], "on_order": i["on_order_units"],
+                "lead_time_days": i["lead_time_days_avg"], "lead_time_sd_days": i["lead_time_days_sd"],
+                "shelf_life_days": i["shelf_life_days"], "pack_size": i["pack_size"],
+                "safety_stock_units": i["safety_stock_units"], "promo_uplift": i["promo_uplift"],
+                "planned_promotions": promo_periods(i["planned_promo_days"])},
     }
 
 
@@ -77,7 +94,9 @@ def recommend_orders(location_id: str | None = None, sku: str | None = None, hor
         "rows_total": len(rows),
         "rows": [compact(r) for r in shown],
         "overstock": [{"sku": r["sku"], "product": r["product_name"], "location_id": r["location_id"],
-                       "days_of_cover": r["days_of_cover"], "capital_releasable_nok": r["capital_releasable_nok"]}
+                       "location": r["location_name"], "days_of_cover": r["days_of_cover"],
+                       "stock_value_nok": round(r["inputs"]["on_hand_units"] * r["inputs"]["unit_cost_nok"]),
+                       "capital_releasable_nok": r["capital_releasable_nok"]}
                       for r in sorted(rows, key=lambda r: r["capital_releasable_nok"], reverse=True) if r["overstock"]],
     }
 
@@ -92,7 +111,8 @@ recommend_orders_tool = Tool(
         "(more than 6 weeks of cover) with the capital that could be released. Without filters you get the "
         f"top {TOP_ROWS_FOR_AGENT} rows by NOK impact plus totals; filter by location_id and/or sku for details. "
         "Use this for any question about what or how much to order, stockouts, waste risk or overstock. "
-        "Cite it as a tool source with the exact arguments you used."
+        "The result has a call_id: cite a claim as a tool source with that call_id, the row "
+        "({\"sku\": ..., \"location_id\": ...} or \"summary\" for totals) and the fields holding its numbers."
     ),
     input_schema={
         "type": "object",

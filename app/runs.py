@@ -62,3 +62,25 @@ def get_tree(run_id: str) -> dict | None:
         if parent in nodes:
             nodes[parent]["children"].append(node)
     return nodes[run_id]
+
+
+# ---------- full tool outputs (evidence for tool citations) ----------
+
+def save_tool_call(run_id: str, call_id: str, tool: str, arguments: dict, output) -> None:
+    """Store one tool call's full output. json round-trip turns dates etc. into plain JSON."""
+    with db.connect() as conn:
+        conn.execute(
+            "insert into tool_calls (call_id, run_id, tool, arguments, output) values (%s, %s, %s, %s, %s) "
+            "on conflict (call_id) do nothing",
+            (call_id, run_id, tool, Jsonb(_plain_json(arguments)), Jsonb(_plain_json(output))))
+
+
+def get_tool_call(call_id: str) -> dict | None:
+    with db.connect() as conn:
+        return conn.execute("select call_id, run_id, tool, arguments, output from tool_calls where call_id = %s",
+                            (call_id,)).fetchone()
+
+
+def _plain_json(value):
+    import json
+    return json.loads(json.dumps(value, default=str))

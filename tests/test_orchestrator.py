@@ -1,21 +1,21 @@
 """Orchestrator + specialists (fake LLM, fake tools, fake run logging; no network)."""
+import json
+
 import pytest
 
+from app import runs
 from app.agent import loop, orchestrator, service
 from app.llm import LLMResponse, Tool, ToolCall
 
 SQL = "select sum(stock_value_nok) from inventory_current"
-PLAN = {"rows": [{"sku": "SKU009", "next_order": {"order_date": "2026-11-06", "qty": 40}}]}
+PLAN = {"rows": [{"sku": "SKU009", "location_id": "L04", "product": "Røkt laks 300 g",
+                  "location": "Høyden Nettbutikk", "next_order": {"order_date": "2026-11-06", "qty": 40}}]}
 
 FAKE_PLAN = Tool("recommend_orders", "plan", {"type": "object", "properties": {"sku": {"type": "string"}}},
                  run=lambda **kw: PLAN)
 FAKE_SQL = Tool("query_database", "sql", {"type": "object", "properties": {"sql": {"type": "string"}}},
                 run=lambda sql: {"rows": [{"sum": 393306}]})
-
-SOURCES = [
-    {"claim": "Order 40 smoked salmon today", "tool": "recommend_orders", "arguments": {"sku": "SKU009"}},
-    {"claim": "Stock is worth NOK 393k", "table": "inventory_current", "sql": SQL},
-]
+DB_SOURCE = {"claim": "Stock is worth NOK 393k", "table": "inventory_current", "sql": SQL}
 
 
 @pytest.fixture
@@ -34,24 +34,39 @@ def setup(monkeypatch):
     for module in (service.runs, orchestrator.runs):
         monkeypatch.setattr(module, "create_run", create_run)
         monkeypatch.setattr(module, "finish_run", lambda run_id, status, trace, **kw: finished.append((run_id, status)))
+    monkeypatch.setattr(runs, "save_tool_call", lambda *a, **kw: None)
     monkeypatch.setattr(service, "build_system_prompt", lambda custom, **kw: custom)
     return created, finished
 
 
-def role_llm(final_sources):
-    """Orchestrator: delegate to both, then submit. Specialists: use their tool, then answer."""
+def tool_outputs(messages) -> list[dict]:
+    return [json.loads(m["content"]) for m in messages if m["role"] == "tool" and m["content"].startswith("{")]
+
+
+def role_llm(orchestrator_sources=None):
+    """Orchestrator: delegate to both, then submit the specialists' sources (or the given ones).
+    Specialists: use their tool, then submit a cited answer."""
     def fake(system, messages, tools, force_tool=None):
         names = [t.name for t in tools]
-        tool_results = [m for m in messages if m["role"] == "tool"]
+        results = tool_outputs(messages)
         if "ask_data_analyst" in names:                       # orchestrator
-            if not tool_results:
+            if not results:
                 return LLMResponse("", [ToolCall("d1", "ask_data_analyst", {"question": "Stock value?"}),
                                         ToolCall("d2", "ask_inventory_planner", {"question": "What to order?"})])
-            summary = "Order 40 salmon [1]. Stock is NOK 393k [2]." if len(final_sources) == 2 else "Order salmon [1]."
-            return LLMResponse("", [ToolCall("s", "submit_answer", {"summary": summary, "sources": final_sources})])
-        if names == ["query_database"]:                       # data analyst
-            return LLMResponse("393306") if tool_results else LLMResponse("", [ToolCall("q", "query_database", {"sql": SQL})])
-        return LLMResponse("40 units") if tool_results else LLMResponse("", [ToolCall("q", "recommend_orders", {"sku": "SKU009"})])
+            sources = orchestrator_sources or [s for r in results for s in r["answer"]["sources"]]
+            text = " ".join(f"{s['claim']} [{i}]." for i, s in enumerate(sources, 1))
+            return LLMResponse("", [ToolCall("s", "submit_answer", {"summary": text, "sources": sources})])
+        if "query_database" in names:                         # data analyst
+            if not results:
+                return LLMResponse("", [ToolCall("q", "query_database", {"sql": SQL})])
+            return LLMResponse("", [ToolCall("a", "submit_answer", {"answer": "Stock is NOK 393k [1].",
+                                                                    "sources": [DB_SOURCE]})])
+        if not results:                                       # inventory planner
+            return LLMResponse("", [ToolCall("q", "recommend_orders", {"sku": "SKU009"})])
+        source = {"claim": "Order 40 units of Røkt laks 300 g", "tool": "recommend_orders",
+                  "call_id": results[0]["call_id"], "row": {"sku": "SKU009", "location_id": "L04"},
+                  "fields": ["next_order.qty"]}
+        return LLMResponse("", [ToolCall("a", "submit_answer", {"answer": "Order 40 units [1].", "sources": [source]})])
     return fake
 
 
@@ -60,15 +75,14 @@ SCHEMA = {"type": "object", "properties": {"summary": {"type": "string"}}, "requ
 
 def run_orchestrator(events=None):
     return service.execute(service.RunRequest(task="What should we order for Christmas?", mode="orchestrator",
-                                              output_schema=SCHEMA), on_event=(events or []).append)
+                                              output_schema=SCHEMA), on_event=(events if events is not None else []).append)
 
 
 def test_delegation_tree_in_trace_and_runs(monkeypatch, setup):
     created, finished = setup
-    monkeypatch.setattr(loop, "call_llm", role_llm(SOURCES))
+    monkeypatch.setattr(loop, "call_llm", role_llm())
     events = []
-    r = service.execute(service.RunRequest(task="What should we order for Christmas?", mode="orchestrator",
-                                           output_schema=SCHEMA), on_event=events.append)
+    r = run_orchestrator(events)
 
     # agent_runs: orchestrator + two children pointing at it (children start in parallel: any order)
     assert created[0] == ("orchestrator-1", None)
@@ -92,18 +106,24 @@ def test_delegation_tree_in_trace_and_runs(monkeypatch, setup):
     assert child_tools == {("data_analyst", children["data_analyst"][0], "query_database"),
                            ("inventory_planner", children["inventory_planner"][0], "recommend_orders")}
 
-    # the orchestrator could cite what its specialists found
-    assert r["answer"]["sources"] == SOURCES
+    # the orchestrator re-cited its specialists' checked sources: SQL, and the planner's call_id + row + fields
+    sources = r["answer"]["sources"]
+    assert DB_SOURCE in sources
+    tool_source = next(s for s in sources if "tool" in s)
+    planner_call = next(e for e in delegations[1]["child_trace"] if e["type"] == "tool")["call_id"]
+    assert tool_source["call_id"] == planner_call and tool_source["fields"] == ["next_order.qty"]
+    assert "warnings" not in r["answer"]
 
 
-def test_orchestrator_cannot_cite_what_specialists_did_not_find(monkeypatch, setup):
-    invented = [{**SOURCES[0], "arguments": {"sku": "SKU001"}}]   # the planner was asked about SKU009
+def test_orchestrator_cannot_cite_a_call_that_did_not_run(monkeypatch, setup):
+    invented = [{"claim": "Order 40", "tool": "recommend_orders", "call_id": "rc-000000",
+                 "row": {"sku": "SKU009", "location_id": "L04"}, "fields": ["next_order.qty"]}]
     monkeypatch.setattr(loop, "call_llm", role_llm(invented))  # keeps submitting the bad citation
     r = run_orchestrator()
     rejected = [e for e in r["trace"] if e["type"] == "final_answer"]
     assert rejected and not any(e["valid"] for e in rejected)
-    assert "was not called successfully" in rejected[0]["errors"][0]
-    assert r["stopped_reason"] == "max_steps"
+    assert "call_id 'rc-000000' is not a recommend_orders call from this run" in rejected[0]["errors"][0]
+    assert r["stopped_reason"] == "max_steps"     # a made-up call_id is never accepted
 
 
 def test_orchestrator_has_no_direct_data_tools():
@@ -127,7 +147,7 @@ def test_specialists_only_see_their_own_context(monkeypatch):
     analyst_prompt = service.build_system_prompt("p", tables=analyst.sees_tables, documents=analyst.sees_documents)
     planner_prompt = service.build_system_prompt("p", tables=planner.sees_tables, documents=planner.sees_documents)
     assert "TABLES" in analyst_prompt and "DOCS" not in analyst_prompt
-    assert planner_prompt == "p\n\nCONTEXT"            # business context only: no SQL, so no table list
+    assert planner_prompt == f"p\n\n{service.ANSWER_STYLE}\n\nCONTEXT"   # no SQL, so no table list
 
 
 def test_specialists_run_in_parallel_and_tree_stays_correct(monkeypatch, setup):
@@ -145,7 +165,7 @@ def test_specialists_run_in_parallel_and_tree_stays_correct(monkeypatch, setup):
 
     monkeypatch.setattr(FAKE_SQL, "run", slow("sql", {"rows": [{"sum": 393306}]}))
     monkeypatch.setattr(FAKE_PLAN, "run", slow("plan", PLAN))
-    monkeypatch.setattr(loop, "call_llm", role_llm(SOURCES))
+    monkeypatch.setattr(loop, "call_llm", role_llm())
     created, finished = setup
 
     t0 = time.monotonic()
@@ -161,6 +181,3 @@ def test_specialists_run_in_parallel_and_tree_stays_correct(monkeypatch, setup):
     assert [d["specialist"] for d in delegations] == ["data_analyst", "inventory_planner"]
     assert all(d["parallel"] for d in delegations)
     assert {c for c, parent in created if parent == "orchestrator-1"} == {d["child_run_id"] for d in delegations}
-    assert [e["tool"] for e in delegations[0]["child_trace"] if e["type"] == "tool"] == ["query_database"]
-    assert [e["tool"] for e in delegations[1]["child_trace"] if e["type"] == "tool"] == ["recommend_orders"]
-    assert r["answer"]["sources"] == SOURCES
